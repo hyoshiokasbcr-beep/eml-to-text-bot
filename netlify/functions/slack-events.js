@@ -105,20 +105,26 @@ export async function handler(event) {
   // ---------- [テスト専用] ここだけで通る特別経路 ----------
   // 本番のSlackイベントでは決して使われないフィールド名 "__test_base64_eml" をキーにしています。
   // netlify dev でローカル起動 → curl で base64化した .eml を投げると、解析結果の preview を返します。
-  try {
-    const j = JSON.parse(rawBody || "{}");
-    if (j.__test_base64_eml) {
-      const emlBuf = Buffer.from(j.__test_base64_eml, "base64");
-      let text;
-      try {
-        text = await parseEmlToText(emlBuf);     // まず通常解析
-      } catch {
-        text = emlBuf.toString("utf8");          // 失敗時はそのまま
-      }
-      text = truncateByBytes(text, MAX_TXT_BYTES);
-      return { statusCode: 200, body: JSON.stringify({ ok: true, preview: text.slice(0, 4000) }) };
-    }
-  } catch { /* ignore */ }
+ // ---------- [テスト専用] ----------
+try {
+  const j = JSON.parse(event.body || "{}");
+  if (j.__test_base64_eml) {
+    const emlBuf = Buffer.from(j.__test_base64_eml, "base64");
+    let text;
+    try { text = await parseEmlToText(emlBuf); }
+    catch { text = emlBuf.toString("utf8"); }
+    text = truncateByBytes(text, MAX_TXT_BYTES);
+
+    // ← ここで charset を明示
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ ok: true, preview: text.slice(0, 4000) }),
+    };
+  }
+} catch {}
+// ---------------------------------
+
   // ----------------------------------------------------------
 
   // URL検証（最優先）
