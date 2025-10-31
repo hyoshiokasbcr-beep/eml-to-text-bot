@@ -112,12 +112,69 @@ export async function handler(event) {
   const rawBody = event.body || "";
 
   // 0) URL 検証（まずこれを返すとセットアップがスムーズ）
-  try {
-    const j = JSON.parse(rawBody || "{}");
-    if (j.type === "url_verification" && j.challenge) {
-      return ok(j.challenge);
-    }
-  } catch {/* ignore */}
+-  try {
+-    // 3) .eml 取得 → 解析 → テキスト化
+-    const emlBuf = await downloadPrivateFile(file);
+-    let text = await parseEmlToText(emlBuf);
+-    text = truncateByBytes(text, MAX_TXT_BYTES);
+-
+-    // 4) アップロード（同スレッド）
+-    const filename = toTxtFilename(file.name || file.title);
+-    await uploadTxtToSlack({
+-      channel: evt.channel,
+-      thread_ts: evt.thread_ts || evt.ts,
+-      filename,
+-      content: text,
+-    });
+-
+-    return ok("done");
+-  } catch (e) {
++  try {
++    // 3) .eml 取得
++    const emlBuf = await downloadPrivateFile(file);
++
++    // 3.1) まずは mailparser でテキスト化を試す
++    let text;
++    try {
++      text = await parseEmlToText(emlBuf);
++    } catch (pe) {
++      console.warn("PARSE_ERROR_fallback_to_raw", String(pe));
++      // 失敗時は“そのまま”をUTF-8として扱う（要望どおり）
++      text = emlBuf.toString("utf8");
++    }
++    // 上限適用
++    text = truncateByBytes(text, MAX_TXT_BYTES);
++
++    // 4) アップロード（同スレッド）
++    const filename = toTxtFilename(file.name || file.title);
++    await uploadTxtToSlack({
++      channel: evt.channel,
++      thread_ts: evt.thread_ts || evt.ts,
++      filename,
++      content: text,
++    });
++    return ok("done");
++  } catch (e) {
++    // ダウンロード失敗などの詳細をログに出す
++    console.error("PROCESS_ERROR", e && (e.stack || e));
+     // 失敗時はスレッドに簡単なエラーを返す（本文ログは残さない）
+     try {
+       await fetch("https://slack.com/api/chat.postMessage", {
+         method: "POST",
+         headers: {
+           Authorization: `Bearer ${BOT_TOKEN}`,
+           "Content-Type": "application/json; charset=utf-8",
+         },
+         body: JSON.stringify({
+           channel: evt.channel,
+           thread_ts: evt.thread_ts || evt.ts,
+           text: "⚠️ .eml の展開に失敗しました。元ファイルをご確認ください。",
+         }),
+       });
+     } catch {}
+     return ok("error handled");
+   }
+
 
   // 1) 署名検証
   if (!verifySlackSignature(event.headers, rawBody)) {
