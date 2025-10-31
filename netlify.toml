@@ -1,0 +1,12 @@
+[build]
+  functions = "netlify/functions"
+  command = "npm ci"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["mailparser", "html-to-text"]
+
+[[headers]]
+  for = "/.netlify/functions/*"
+  [headers.values]
+  Cache-Control = "no-store"
