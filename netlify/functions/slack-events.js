@@ -38,11 +38,18 @@ export async function handler(event) {
   // 対象チャンネル制限（任意）
   if (TARGET_CHANNELS.length && !TARGET_CHANNELS.includes(evt.channel)) return ok();
 
-  // .eml 判定
-  const file = (evt.files || []).find(f =>
-    f && (f.mimetype === "message/rfc822" || f.filetype === "eml")
-  );
-  if (!file) return ok();
+   // .eml 判定
+   const file = (evt.files || []).find(f =>
+     f && (f.mimetype === "message/rfc822" || f.filetype === "eml")
+   );
+   // .eml 判定（mimetype/filetypeがtext扱いでも、拡張子で拾う）
+   const file = (evt.files || []).find(f => {
+     if (!f) return false;
+     const name = (f.name || f.title || "").toLowerCase();
+     const byExt = name.endsWith(".eml");
+     const byType = (f.mimetype === "message/rfc822") || (f.filetype === "eml");
+     return byExt || byType;
+   });
 
   // .eml取得
   const emlBuf = await fetch(file.url_private, {
