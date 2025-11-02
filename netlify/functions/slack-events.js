@@ -1,183 +1,93 @@
 // netlify/functions/slack-events.js
-// EMLは常に変換／Slackは1通のコードブロック／長文は安全長でカット＋案内文
-import crypto from "node:crypto";
+// ESM（import/export）& Response で返す版
 import { simpleParser } from "mailparser";
 import { htmlToText } from "html-to-text";
 
-const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;             // xoxb-...
-const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;   // Slack App > Basic Information
-const TZ = process.env.TZ || "Asia/Tokyo";
+// Slackに投げる前に要約コードブロックを作る（本文は安全長でカット）
+const SAFE_BODY_LIMIT = Number(process.env.SAFE_BODY_LIMIT ?? 3400);
 
-// 空なら全チャンネル許可。指定時はそのCHのみ処理（省トークン）
-const TARGET_CHANNELS = (process.env.TARGET_CHANNELS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
-
-// Slack出力の安全長（1通固定）
-const MAX_SAFE_LEN = Number(process.env.MAX_SAFE_LEN || 35000);
-
-// ---------- 共通ユーティリティ ----------
-function verifySlackSignature(headers, rawBody) {
-  const ts = headers["x-slack-request-timestamp"];
-  const sig = headers["x-slack-signature"];
-  if (!ts || !sig) return false;
-  const base = `v0:${ts}:${rawBody}`;
-  const hash = crypto.createHmac("sha256", SIGNING_SECRET).update(base).digest("hex");
-  return `v0=${hash}` === sig;
-}
-const channelAllowed = (chid) => (!TARGET_CHANNELS.length) || (chid && TARGET_CHANNELS.includes(chid));
-
-async function slackApi(method, body) {
-  const res = await fetch(`https://slack.com/api/${method}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${BOT_TOKEN}`, "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(body),
-  });
-  const j = await res.json();
-  if (!j.ok) throw new Error(`${method} failed: ${JSON.stringify(j)}`);
-  return j;
-}
-
-function html2txt(html) {
-  return htmlToText(html, {
-    wordwrap: false,
-    selectors: [{ selector: "a", options: { hideLinkHrefIfSameAsText: true } }],
-  });
-}
-function sanitizeForCodeBlock(text) {
-  return (text || "")
-    .replace(/```/g, "'''")   // コードブロック内の```事故防止
-    .replace(/^>/gm, "＞");   // 行頭>の引用色付き防止（宛名など）
-}
-function extractUrls(text) {
-  if (!text) return [];
-  const urls = text.match(/https?:\/\/[^\s<>"')]+/g) || [];
-  return [...new Set(urls)].slice(0, 10);
-}
-function fmtDate(d) {
-  try { return new Date(d).toLocaleString("ja-JP", { timeZone: TZ, hour12: false }); }
-  catch { return String(d || ""); }
-}
-
-// ---------- EML パース ----------
-async function parseEml(buf) {
-  const mail = await simpleParser(buf);
-  const subject = mail.subject || "(no subject)";
-  const from = mail.from?.text || mail.headers.get("from") || "";
-  const to = mail.to?.text || mail.headers.get("to") || "";
-  const date = mail.date || mail.headers.get("date") || "";
-
-  let bodyText = "";
-  if (mail.text && mail.text.trim()) bodyText = mail.text;
-  else if (mail.html && mail.html.trim()) bodyText = html2txt(mail.html);
-  else bodyText = "(no body)";
-
-  // 改行を統一
-  bodyText = bodyText.replace(/\r\n/g, "\n");
-
-  return { subject, from, to, date, bodyText, urls: extractUrls(bodyText) };
-}
-
-// ---------- 投稿（1メッセージ固定） ----------
-async function postOne({ channel, fileName, parsed }) {
-  const headerLines = [
-    `*件名:* ${parsed.subject}`,
-    parsed.from ? `*From:* ${parsed.from}` : null,
-    parsed.to   ? `*To:* ${parsed.to}`     : null,
-    parsed.date ? `*Date:* ${fmtDate(parsed.date)}` : null,
-    `*ファイル:* ${fileName || "mail.eml"}`
-  ].filter(Boolean);
-
-  if (parsed.urls.length) {
-    headerLines.push(`*URLs:*`);
-    parsed.urls.forEach(u => headerLines.push(`• ${u}`));
+// 本文のプレビュー（Slack用コードブロック）を作成
+function buildCodeBlockPreview(mail) {
+  // text が乏しい or 無いときは html からテキスト化
+  let text = (mail.text || "").trim();
+  if ((!text || text.length < 10) && mail.html) {
+    text = htmlToText(mail.html, {
+      wordwrap: false,
+      selectors: [{ selector: "a", options: { hideLinkHrefIfSameAsText: true } }],
+    }).trim();
   }
 
-  // 本文を安全化 → 既定長でトリム → 長文案内を追加
-  let body = sanitizeForCodeBlock(parsed.bodyText);
-  if (body.length > MAX_SAFE_LEN) {
-    body = body.slice(0, MAX_SAFE_LEN) +
-      "\n\n---\n💡 *このメールは長文のため一部省略されています。*\n" +
-      "続きを参照したい場合は `.eml` ファイルを生成AIなどでご確認ください。";
-  }
+  // 改行を統一・不要文字除去
+  text = (text || "").replace(/\r?\n/g, "\n").replace(/\u0000/g, "").trim();
 
-  const postText = `${headerLines.join("\n")}\n\n\`\`\`\n${body}\n\`\`\``;
-  await slackApi("chat.postMessage", { channel, text: postText });
+  // ヘッダ部（見やすさ優先）
+  const head = [
+    `From: ${mail.from?.text ?? ""}`,
+    `To: ${mail.to?.text ?? ""}`,
+    `Subject: ${mail.subject ?? ""}`,
+    `Date: ${mail.date ? new Date(mail.date).toISOString() : ""}`,
+  ].join("\n");
+
+  // 安全長で本文を切る
+  const body = text.slice(0, SAFE_BODY_LIMIT);
+
+  // Slack コードブロック
+  const code =
+    "```text\n" + head + "\n\n" + body + "\n```\n" +
+    "_※続きは元メール（.eml）をご確認ください_";
+
+  return code;
 }
 
-// ---------- メインハンドラ ----------
-export default async (event) => {
-  const rawBody = event.body || "";
-
-  // 1) SlackのURL検証（challenge）
+export default async (req) => {
   try {
-    const j = JSON.parse(rawBody);
-    if (j?.type === "url_verification" && j?.challenge) {
-      return { statusCode: 200, body: j.challenge };
+    if (req.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
     }
-  } catch {}
 
-  // 2) 低コスト・テスト（Slack APIを呼ばずに解析プレビューを返す）
-  try {
-    const t = JSON.parse(rawBody);
-    if (t?.__test_base64_eml) {
-      const buf = Buffer.from(t.__test_base64_eml, "base64");
-      const p = await parseEml(buf);
-      const headerPreview = `件名: ${p.subject} / From: ${p.from}`;
-      const preview = p.bodyText.replace(/\s+/g, " ").slice(0, 220);
-      return {
-        statusCode: 200,
-        headers: { "Content-Type": "application/json; charset=utf-8" },
-        body: JSON.stringify({ ok: true, headerPreview, preview }),
-      };
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(
+        JSON.stringify({ ok: false, error: "invalid_json" }),
+        { status: 400, headers: { "content-type": "application/json; charset=utf-8" } }
+      );
     }
-  } catch {}
 
-  // 3) 本番ルート：署名検証 & 早期return
-  if (!verifySlackSignature(event.headers, rawBody)) return { statusCode: 401, body: "invalid signature" };
-  if (event.headers["x-slack-retry-num"]) return { statusCode: 200, body: "" };
+    // --- Slack の URL 検証（challenge） ---
+    if (body?.type === "url_verification" && body?.challenge) {
+      // Slack は 200 で challenge 文字列をそのまま返す必要あり（text/plain）
+      return new Response(body.challenge, {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    }
 
-  const body = JSON.parse(rawBody || "{}");
-  if (body?.type !== "event_callback") return { statusCode: 200, body: "" };
-  const ev = body.event;
-  if (ev?.type !== "file_shared") return { statusCode: 200, body: "" };
+    // --- CLI/PowerShell テスト経路: base64 の .eml を直送 ---
+    if (body?.__test_base64_eml) {
+      const buf = Buffer.from(body.__test_base64_eml, "base64");
+      const mail = await simpleParser(buf);
+      const preview = buildCodeBlockPreview(mail);
 
-  const channel_id = ev.channel_id;
-  if (!channelAllowed(channel_id)) return { statusCode: 200, body: "" };
+      // ここでは Slack 投稿は行わず、プレビューだけ返す
+      return new Response(
+        JSON.stringify({ ok: true, preview }),
+        { status: 200, headers: { "content-type": "application/json; charset=utf-8" } }
+      );
+    }
 
-  // 4) file 情報
-  let file;
-  try {
-    const info = await slackApi("files.info", { file: ev.file_id });
-    file = info.file;
-  } catch { return { statusCode: 200, body: "" }; }
+    // --- 本番の Slack Events（ここでは即 200 応答だけ。必要に応じて拡張してOK）---
+    // 例：署名検証・files.info で EML を取りに行く・Slackに投稿…などはここに実装
+    return new Response(
+      JSON.stringify({ ok: true, message: "ack" }),
+      { status: 200, headers: { "content-type": "application/json; charset=utf-8" } }
+    );
 
-  // .eml 判定（拡張子 / mimetype）
-  const isEml = (file?.filetype === "eml") ||
-                (file?.mimetype || "").includes("message/rfc822") ||
-                (file?.name || "").toLowerCase().endsWith(".eml");
-  if (!isEml) return { statusCode: 200, body: "" };
-
-  // 5) ダウンロード（サイズに関係なく常に実行）
-  const url = file?.url_private_download || file?.url_private;
-  if (!url) return { statusCode: 200, body: "" };
-
-  let emlBuf;
-  try {
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${BOT_TOKEN}` } });
-    if (!res.ok) throw new Error(`download failed: ${res.status}`);
-    emlBuf = Buffer.from(await res.arrayBuffer());
-  } catch {
-    try { await slackApi("chat.postMessage", { channel: channel_id, text: `:x: \`${file.name}\` のダウンロードに失敗しました。` }); } catch {}
-    return { statusCode: 200, body: "" };
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ ok: false, error: err?.message ?? String(err) }),
+      { status: 500, headers: { "content-type": "application/json; charset=utf-8" } }
+    );
   }
-
-  // 6) 解析 → 投稿（1メッセージ固定）
-  try {
-    const parsed = await parseEml(emlBuf);
-    await postOne({ channel: channel_id, fileName: file.name || "mail.eml", parsed });
-  } catch {
-    try { await slackApi("chat.postMessage", { channel: channel_id, text: `:x: \`${file.name}\` の解析・展開に失敗しました。` }); } catch {}
-  }
-
-  return { statusCode: 200, body: "" };
 };
