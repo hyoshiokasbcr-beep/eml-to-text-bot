@@ -1,18 +1,12 @@
 {
   "name": "eml-to-text-bot",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "dev": "netlify dev",
-    "build": "echo build",
-    "start": "netlify dev"
-  },
   "dependencies": {
+    "@netlify/blobs": "^8.1.0",
     "html-to-text": "^9.0.5",
-    "mailparser": "^3.6.7",
+    "mailparser": "^3.8.1",
+    "msgreader": "^1.12.0",
     "node-fetch": "^3.3.2"
-  },
-  "devDependencies": {
-    "netlify-cli": "^17.34.0"
   }
 }
