@@ -1,8 +1,10 @@
 {
   "name": "eml-to-text-bot",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@netlify/blobs": "^8.1.0",
     "html-to-text": "^9.0.5",
