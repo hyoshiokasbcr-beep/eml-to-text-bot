@@ -1,9 +1,8 @@
-// Netlify Function: slack-events (ESM)
-// 目的:
-//  - Slackの file_shared / message(files付き) から .eml / .msg / .oft を回収 → テキスト化 → コードブロックで投稿
-//  - 設定は Netlify Blobs (config/runtime.json) から都度ロード：DRY_RUN/サイズ上限/本文長/チャンネル/ログレベル
-//  - 手動テスト：__test_base64_eml / __test_base64_msg / __test_base64_oft を受け付け
-//  - 文字化け/漏洩を避ける軽量ログ（ログレベル切替）
+// Netlify Function (Functions v2 / ESM)
+// - .eml / .msg / .oft を受け取り → テキスト化 → Slackにコードブロック投稿
+// - ランタイム設定は Netlify Blobs "config/runtime.json" から毎回ロード（ノーデプロイ反映）
+// - 手動テスト: __test_base64_eml / __test_base64_msg / __test_base64_oft
+// - LOG_LEVEL: off|minimal|errors|verbose
 
 import crypto from "crypto";
 import fetch from "node-fetch";
@@ -12,23 +11,23 @@ import { convert as htmlToText } from "html-to-text";
 import MsgReader from "msgreader";
 import { getStore } from "@netlify/blobs";
 
-// ====== 秘密情報（環境変数：デプロイ時に設定） ======
+// ====== Secrets (Netlify 環境変数で設定) ======
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET || "";
 
-// ====== 既定値（Blobsが無い/壊れている時のフォールバック） ======
+// ====== フォールバック（Blobsが無い/壊れてる時） ======
 const DEFAULTS = {
   DRY_RUN: true,
   MAX_FILE_BYTES: 4 * 1024 * 1024, // 4MB
-  MAX_POST_CHARS: 3600,            // Slack安全長（余白あり）
+  MAX_POST_CHARS: 3600,
   TARGET_CHANNELS: [],             // 例: ["C0123456789"]
   LOG_LEVEL: "minimal"             // off|minimal|errors|verbose
 };
 
-// ====== ランタイム設定のロード (Netlify Blobs) ======
+// ====== Blobs 設定ロード ======
 async function loadConfig() {
   try {
-    const store = getStore({ name: "config" }); // Blobs ストア名
+    const store = getStore({ name: "config" }); // Blob store: "config"
     const json = await store.get("runtime.json", { type: "json" });
     if (!json) return DEFAULTS;
     return {
@@ -44,29 +43,34 @@ async function loadConfig() {
   }
 }
 
-// ====== ログ（レベル別） ======
+// ====== ログユーティリティ ======
 function makeLogger(level = "minimal") {
   const order = { off: 0, errors: 1, minimal: 2, verbose: 3 };
-  const allow = (want) => (order[level] >= order[want]);
-
+  const ok = (need) => order[level] >= order[need];
   return {
-    v: (...a) => { if (allow("verbose"))  console.log(...a); },
-    m: (...a) => { if (allow("minimal"))  console.log(...a); },
-    e: (...a) => { if (allow("errors"))   console.error(...a); }
+    v: (...a) => { if (ok("verbose"))  console.log(...a); },
+    m: (...a) => { if (ok("minimal"))  console.log(...a); },
+    e: (...a) => { if (ok("errors"))   console.error(...a); }
   };
 }
 
-// ====== ユーティリティ ======
+// ====== JSONレスポンス ======
 const json = (status, body) => new Response(JSON.stringify(body), {
   status,
   headers: { "content-type": "application/json; charset=utf-8" }
 });
 
+// ====== Slack署名検証 ======
 function verifySlackSignature(request, bodyRaw) {
-  if (!SLACK_SIGNING_SECRET) return true; // テスト時の救済
+  if (!SLACK_SIGNING_SECRET) return true; // 署名未設定の時はスキップ（手動テスト用）
   const ts  = request.headers.get("x-slack-request-timestamp");
   const sig = request.headers.get("x-slack-signature");
   if (!ts || !sig) return false;
+
+  // 5分超のリプレイを拒否
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - parseInt(ts, 10)) > 60 * 5) return false;
+
   const base = `v0:${ts}:${bodyRaw}`;
   const hmac = crypto.createHmac("sha256", SLACK_SIGNING_SECRET).update(base).digest("hex");
   const expect = `v0=${hmac}`;
@@ -77,7 +81,14 @@ function verifySlackSignature(request, bodyRaw) {
   }
 }
 
-// RTF簡易プレーン化（依存増やさず軽量で）
+// ====== テキスト整形 ======
+function html2text(html) {
+  return htmlToText(html || "", {
+    wordwrap: false,
+    selectors: [{ selector: "a", options: { hideLinkHrefIfSameAsText: true } }]
+  });
+}
+
 function stripRTF(maybeRtf) {
   if (!maybeRtf) return "";
   if (!/\\rtf1/.test(maybeRtf)) return maybeRtf;
@@ -89,14 +100,7 @@ function stripRTF(maybeRtf) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
-function html2text(html) {
-  return htmlToText(html || "", {
-    wordwrap: false,
-    selectors: [{ selector: "a", options: { hideLinkHrefIfSameAsText: true } }]
-  });
-}
-
-// ====== 解析（EML / MSG/OFT） ======
+// ====== .eml / .msg/.oft → テキスト ======
 async function emlToText(buffer) {
   const mail = await simpleParser(buffer);
   const from = mail.from?.text || "";
@@ -189,9 +193,9 @@ async function downloadSlackFile(url_private_download) {
   return Buffer.from(buf);
 }
 
-// ====== イベント処理 ======
+// ====== Slackイベント処理 ======
 async function handleSlackEvent(evt, cfg, log) {
-  // file_shared: ファイルIDから詳細を引くパターン
+  // file_shared: ファイルID → 取得 → 投稿
   if (evt.type === "file_shared" && evt.file_id) {
     const info = await getFileInfo(evt.file_id);
     if (!info.ok) { log.e("files.info failed", info); return { ok: false, error: "files.info_failed" }; }
@@ -214,7 +218,7 @@ async function handleSlackEvent(evt, cfg, log) {
     return await postToSlackCodeBlock(channel, text, null, cfg, log);
   }
 
-  // message: チャンネルに直にファイルが付いているパターン
+  // message: ファイル添付あり
   if (evt.type === "message" && Array.isArray(evt.files) && evt.files.length > 0) {
     for (const f of evt.files) {
       const name = f.name || "";
@@ -233,7 +237,7 @@ async function handleSlackEvent(evt, cfg, log) {
   return { ok: true, ignored: true };
 }
 
-// 手動テスト: base64 を直で渡して投稿（Slack経由なし）
+// ====== テスト直POST（Slack経由なし） ======
 async function handleTestBody(body, cfg, log) {
   const { __test_base64_eml, __test_base64_msg, __test_base64_oft } = body || {};
   if (!__test_base64_eml && !__test_base64_msg && !__test_base64_oft) return null;
@@ -248,9 +252,9 @@ async function handleTestBody(body, cfg, log) {
   return { ok: true, posted: !!res.ok || !!res.dry_run, preview: (text || "").slice(0, 120) };
 }
 
-// ====== Netlify エントリポイント (Edge-like fetch) ======
+// ====== エントリポイント（Functions v2 / fetch） ======
 export default {
-  async fetch(request) {
+  async fetch(request, context) {
     const cfg = await loadConfig();
     const log = makeLogger(cfg.LOG_LEVEL);
 
@@ -260,17 +264,17 @@ export default {
       log.m("[recv]", { len: bodyRaw.length, head });
     }
 
-    // SlackのURL検証
+    // Slack の URL 検証
     try {
       const obj = JSON.parse(bodyRaw || "{}");
       if (obj.type === "url_verification" && obj.challenge) {
         return json(200, { challenge: obj.challenge });
       }
-    } catch { /* noop */ }
+    } catch {}
 
-    // 署名検証（本物のSlack → 署名あり / 手動テストは __test_* を許可）
-    const verified = verifySlackSignature(request, bodyRaw);
-    if (!verified) {
+    // 署名検証（Slack本番） or 手動テスト救済
+    const isVerified = verifySlackSignature(request, bodyRaw);
+    if (!isVerified) {
       try {
         const testObj = JSON.parse(bodyRaw || "{}");
         const testRes = await handleTestBody(testObj, cfg, log);
@@ -279,7 +283,7 @@ export default {
       return json(401, { ok: false, error: "invalid_signature" });
     }
 
-    // Slackイベント本体
+    // Slackイベント処理
     let payload = {};
     try { payload = JSON.parse(bodyRaw || "{}"); }
     catch { return json(400, { ok: false, error: "bad_json" }); }
@@ -287,7 +291,6 @@ export default {
     if (payload.type === "event_callback" && payload.event) {
       try {
         const result = await handleSlackEvent(payload.event, cfg, log);
-        // Slackの再送対策：基本200返し
         return json(200, result || { ok: true });
       } catch (e) {
         log.e("handler error", e?.message || e);
@@ -295,7 +298,7 @@ export default {
       }
     }
 
-    // その他: __test_* など
+    // その他（__test_*）
     try {
       const testRes = await handleTestBody(payload, cfg, log);
       if (testRes) return json(200, testRes);
