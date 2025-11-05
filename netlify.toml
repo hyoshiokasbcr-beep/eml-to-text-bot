@@ -1,19 +1,10 @@
 [build]
+  command = "npm ci"
   functions = "netlify/functions"
-  # あなたの環境で成功する方を設定（npm ci で失敗するなら npm install）
-  command   = "npm install"
 
 [functions]
   node_bundler = "esbuild"
-  external_node_modules = [
-    "@netlify/blobs",
-    "mailparser",
-    "html-to-text",
-    "msgreader",
-    "node-fetch"
-  ]
+  external_node_modules = ["mailparser", "html-to-text", "msgreader", "@netlify/blobs"]
 
-[[headers]]
-  for = "/.netlify/functions/*"
-  [headers.values]
-  Cache-Control = "no-store"
+[build.environment]
+  NODE_VERSION = "20"
