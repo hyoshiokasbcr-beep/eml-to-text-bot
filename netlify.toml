@@ -1,6 +1,6 @@
 [build]
   functions = "netlify/functions"
-  # 以前 npm ci で失敗しているなら npm install のままでOK
+  # あなたの環境で成功する方を設定（npm ci で失敗するなら npm install）
   command   = "npm install"
 
 [functions]
