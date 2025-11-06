@@ -1,290 +1,350 @@
-// netlify/functions/slack-events.js
-// EML / MSG → 文字起こし → Slackへコードブロック投稿
-// 署名検証 + Blobs への軽量ログ(任意)
+// Slack events handler for EML/MSG preview bot
+//
+// This function receives Slack Events API payloads via the Netlify
+// Functions runtime.  It performs several critical tasks:
+//   • Verifies requests using your Slack signing secret to prevent
+//     forgery or replay attacks.
+//   • Detects file uploads and retrieves the corresponding .eml or
+//     .msg file using the files.info API.  The file is downloaded
+//     privately using the bot token’s authorization header.
+//   • Parses email content with mailparser (for .eml) or msgreader
+//     (for .msg) and converts HTML bodies to plain text via
+//     html-to-text.
+//   • Posts the extracted text back into the same Slack thread using
+//     chat.postMessage.  Long messages are truncated to
+//     `MAX_PREVIEW_CHARS` characters (defaults to 3000) with a tail
+//     notice.
+//   • Optionally logs all events and errors to a Netlify Blobs store
+//     when the LOG_TO_BLOBS environment variable is set to "true".
+//
+// IMPORTANT: This implementation does not use Slack’s deprecated
+// files.upload API.  Instead it posts the preview as a normal
+// message.  If you need to upload files, follow the migration path
+// described by Slack: use files.getUploadURLExternal and
+// files.completeUploadExternal.
 
-import crypto from "node:crypto";
-import fetch from "node-fetch";
-import { simpleParser } from "mailparser";
-import { htmlToText } from "html-to-text";
-import { getStore } from "@netlify/blobs";
+import crypto from 'crypto';
+import { simpleParser } from 'mailparser';
+import { MSGReader } from 'msgreader';
+import { htmlToText } from 'html-to-text';
+import { getStore } from '@netlify/blobs';
 
-// msgreader は default export
-import MSGReader from "msgreader";
+// Read environment variables once at module scope.  If
+// MAX_PREVIEW_CHARS or MAX_FILE_SIZE aren’t defined, fall back to
+// sane defaults.  MAX_FILE_SIZE is in bytes and limits the size of
+// email attachments downloaded from Slack (10 MB by default).  You
+// should adjust MAX_FILE_SIZE to control execution time and memory
+// usage of your function.
+const {
+  SLACK_BOT_TOKEN,
+  SLACK_SIGNING_SECRET,
+  TARGET_CHANNELS,
+  LOG_TO_BLOBS,
+  BLOB_STORE_NAME,
+  MAX_PREVIEW_CHARS,
+  MAX_FILE_SIZE
+} = process.env;
 
-/** ========= 環境変数 =========
- * SLACK_BOT_TOKEN        : Slack Bot User OAuth Token (xoxb-...)
- * SLACK_SIGNING_SECRET   : Slack Signing Secret
- * TARGET_CHANNELS        : (任意) 投稿先チャンネルIDをカンマ区切り。空なら「ファイルが共有されたチャンネルに投稿」
- * LOG_TO_BLOBS           : "true" なら Netlify Blobs に簡易ログを書き込む（手動デプロイ不要）
- * BLOB_STORE_NAME        : Blobs ストア名（省略時 "logs"）
- * MAX_PREVIEW_CHARS      : Slackへ投稿する最大文字数(既定 3000)
- * =========================== */
+const PREVIEW_LIMIT = parseInt(MAX_PREVIEW_CHARS, 10) || 3000;
+const FILE_SIZE_LIMIT = parseInt(MAX_FILE_SIZE, 10) || 10 * 1024 * 1024; // 10 MB
 
-const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
-const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
-const TARGET_CHANNELS = (process.env.TARGET_CHANNELS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const LOG_TO_BLOBS = (process.env.LOG_TO_BLOBS || "false").toLowerCase() === "true";
-const BLOB_STORE_NAME = process.env.BLOB_STORE_NAME || "logs";
-const MAX_PREVIEW_CHARS = Number(process.env.MAX_PREVIEW_CHARS || 3000); // 分割なし、末尾に誘導文を付与
-
-/** --------- 署名検証 --------- */
-function verifySlackSignature({ body, timestamp, signature }) {
-  if (!SIGNING_SECRET) return false;
+// Helper: verify Slack request signature.  Slack sends a timestamp and
+// signature header with every Events API request.  We reject
+// requests if the timestamp is older than ±5 minutes or the HMAC
+// doesn’t match.  See Slack documentation for details:
+// https://api.slack.com/authentication/verifying-requests-from-slack
+function verifySlackSignature({ rawBody, timestamp, signature }) {
+  if (!timestamp || !signature) return false;
+  // Protect against replay attacks by checking the timestamp is
+  // within ±5 minutes of the current time.  Use 300 seconds (5
+  // minutes) as a safe window.  Slack recommends rejecting requests
+  // outside this window.
   const fiveMinutes = 60 * 5;
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - Number(timestamp)) > fiveMinutes) return false;
-
-  const base = `v0:${timestamp}:${body}`;
-  const hmac = crypto.createHmac("sha256", SIGNING_SECRET);
-  hmac.update(base);
-  const digest = `v0=${hmac.digest("hex")}`;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
-  } catch {
+  const ts = parseInt(timestamp, 10);
+  if (Number.isNaN(ts) || Math.abs(now - ts) > fiveMinutes) {
     return false;
   }
+  // Create the basestring: `v0:${timestamp}:${rawBody}` and HMAC it
+  // using your signing secret.
+  const basestring = `v0:${timestamp}:${rawBody}`;
+  const hmac = crypto.createHmac('sha256', SLACK_SIGNING_SECRET || '');
+  hmac.update(basestring);
+  const digest = `v0=${hmac.digest('hex')}`;
+  // Use timingSafeEqual to avoid timing attacks.
+  const sigBuf = Buffer.from(signature, 'utf8');
+  const digestBuf = Buffer.from(digest, 'utf8');
+  if (sigBuf.length !== digestBuf.length) return false;
+  return crypto.timingSafeEqual(sigBuf, digestBuf);
 }
 
-/** --------- 軽量ログ(BLOBS) --------- */
-async function logBlob(key, obj) {
-  if (!LOG_TO_BLOBS) return;
+// Helper: save logs to Netlify Blobs if enabled.  Each log entry is
+// stored under a key based on the current date and a random UUID.
+async function logEvent(keySuffix, data) {
+  if (!LOG_TO_BLOBS || LOG_TO_BLOBS.toLowerCase() !== 'true') return;
   try {
-    const store = getStore(BLOB_STORE_NAME);
-    const time = new Date().toISOString();
-    await store.setJSON(`${key}-${time}.json`, obj, { metadata: { key, time } });
-  } catch (e) {
-    // 失敗しても機能に影響しない
-    console.error("blobs log error:", e);
+    const storeName = BLOB_STORE_NAME || 'logs';
+    const store = getStore(storeName);
+    const key = `${new Date().toISOString()}-${keySuffix}.json`;
+    await store.setJSON(key, data);
+  } catch (err) {
+    // Swallow logging errors so they don’t affect primary flow.
+    console.error('Failed to write log', err);
   }
 }
 
-/** --------- Slack Web API ヘルパー --------- */
-async function slackFetch(path, init = {}) {
-  const url = `https://slack.com/api/${path}`;
-  const res = await fetch(url, {
-    ...init,
+// Helper: parse an email file.  Accepts a Buffer containing the
+// attachment and a filename to determine the parser.  Returns a
+// string with plain text content.  Throws if parsing fails or if
+// the file extension is not supported.
+async function parseEmail(buffer, filename) {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.eml')) {
+    // Use mailparser to parse .eml files.  The returned object may
+    // have .text and .html fields.  Prefer text when available; fall
+    // back to converting HTML to plain text.
+    const parsed = await simpleParser(buffer);
+    if (parsed.text?.trim()) return parsed.text;
+    if (parsed.html) {
+      return htmlToText(parsed.html, { wordwrap: false });
+    }
+    return '';
+  } else if (lower.endsWith('.msg')) {
+    // Use msgreader for .msg files (Outlook format).  The getFileData
+    // method returns an object with body and bodyHTML properties.
+    const reader = new MSGReader(buffer);
+    const data = reader.getFileData();
+    if (data.body?.trim()) return data.body;
+    if (data.bodyHTML) {
+      return htmlToText(data.bodyHTML, { wordwrap: false });
+    }
+    return '';
+  }
+  throw new Error(`Unsupported file type: ${filename}`);
+}
+
+// Helper: determine thread timestamp and channel from a file object.
+// Slack’s files.info response contains a `shares` object keyed by
+// public and private channels.  Each entry includes the timestamp
+// (ts) where the file was posted.  We return the first channel and
+// its ts.  If no shares exist, fall back to TARGET_CHANNELS or
+// null.
+function extractShareInfo(file) {
+  let channel = null;
+  let threadTs = null;
+  if (file.shares) {
+    // public channels
+    if (file.shares.public) {
+      for (const [chan, shares] of Object.entries(file.shares.public)) {
+        channel = chan;
+        if (shares && shares.length > 0) {
+          threadTs = shares[0].ts;
+        }
+        break;
+      }
+    }
+    // private channels or groups if not found in public
+    if (!channel && file.shares.private) {
+      for (const [chan, shares] of Object.entries(file.shares.private)) {
+        channel = chan;
+        if (shares && shares.length > 0) {
+          threadTs = shares[0].ts;
+        }
+        break;
+      }
+    }
+  }
+  // If no share information is available, use the optional
+  // TARGET_CHANNELS environment variable (comma separated list).  Use
+  // the first channel in that list as the default.  Without a
+  // channel the message cannot be posted.
+  if (!channel && TARGET_CHANNELS) {
+    const channels = TARGET_CHANNELS.split(',').map((c) => c.trim()).filter(Boolean);
+    if (channels.length > 0) channel = channels[0];
+  }
+  return { channel, threadTs };
+}
+
+// Helper: post a message back to Slack.  Accepts a channel, text and
+// optional thread_ts.  Returns the response JSON from Slack.  If
+// Slack returns an error, throws.
+async function postMessage(channel, text, threadTs) {
+  const payload = {
+    channel,
+    text,
+    mrkdwn: true
+  };
+  if (threadTs) {
+    payload.thread_ts = threadTs;
+  }
+  const res = await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
     headers: {
-      Authorization: `Bearer ${BOT_TOKEN}`,
-      "Content-Type": "application/json; charset=utf-8",
-      ...(init.headers || {}),
+      'Content-Type': 'application/json; charset=utf-8',
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`
     },
+    body: JSON.stringify(payload)
   });
-  return res.json();
-}
-
-async function slackDownloadPrivate(url) {
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${BOT_TOKEN}` },
-  });
-  if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
-}
-
-/** --------- 投稿(末尾に誘導文) --------- */
-function buildSlackTextBlock(text) {
-  const capped = text.length > MAX_PREVIEW_CHARS ? text.slice(0, MAX_PREVIEW_CHARS) : text;
-  const suffix =
-    text.length > MAX_PREVIEW_CHARS
-      ? "\n\n…（※続きはアップロードされた元のファイルをご参照ください）"
-      : "";
-  return `\`\`\`\n${capped}${suffix}\n\`\`\``;
-}
-
-async function postToSlack({ channel, thread_ts, text }) {
-  return slackFetch("chat.postMessage", {
-    method: "POST",
-    body: JSON.stringify({
-      channel,
-      text,
-      thread_ts,
-      // Escape を避けるために "text" だけ使用（blocks 未使用）
-      // 必要なら blocks にしてもOK
-    }),
-  });
-}
-
-/** --------- 文字起こし --------- */
-async function parseEML(buffer) {
-  const mail = await simpleParser(buffer);
-
-  // 優先: text → html からの変換
-  let body = "";
-  if (mail.text) {
-    body = mail.text;
-  } else if (mail.html) {
-    body = htmlToText(mail.html, {
-      wordwrap: false,
-      preserveNewlines: true,
-    });
+  const json = await res.json();
+  if (!json.ok) {
+    throw new Error(`Slack API error: ${json.error || 'unknown'}`);
   }
-
-  // 先頭に簡単なヘッダ
-  const from = mail.from?.text || "";
-  const to = mail.to?.text || "";
-  const subject = mail.subject || "";
-  const head = [
-    `From   : ${from}`,
-    `To     : ${to}`,
-    `Subject: ${subject}`,
-    "",
-  ].join("\n");
-  return `${head}${body || "(本文なし)"}`;
+  return json;
 }
 
-async function parseMSG(buffer) {
-  // msgreader は ArrayBuffer を要求
-  const reader = new MSGReader(buffer);
-  const data = reader.getFileData();
-  const subject = data.subject || "";
-  const from = data.senderName || "";
-  const to = (data.recipients || [])
-    .map((r) => r.name || r.email || "")
-    .filter(Boolean)
-    .join(", ");
-
-  let body = data.body || data.bodyHTML || "";
-  if (data.bodyHTML && !data.body) {
-    body = htmlToText(data.bodyHTML, { wordwrap: false, preserveNewlines: true });
-  }
-
-  const head = [
-    `From   : ${from}`,
-    `To     : ${to}`,
-    `Subject: ${subject}`,
-    "",
-  ].join("\n");
-
-  return `${head}${body || "(本文なし)"}`;
-}
-
-/** --------- Slack ファイル共有イベント処理 --------- */
-async function handleFileShared(fileId, hintChannels = []) {
-  // files.info で実体を取得
-  const info = await slackFetch(`files.info?file=${encodeURIComponent(fileId)}`);
-  if (!info.ok) throw new Error(`files.info failed: ${info.error}`);
-  const file = info.file;
-
-  // ダウンロードURL
-  const urlPriv = file.url_private_download || file.url_private;
-  if (!urlPriv) throw new Error("no downloadable url");
-
-  // 拡張子・MIME で分岐
-  const name = file.name || "";
-  const lower = name.toLowerCase();
-
-  const buf = await slackDownloadPrivate(urlPriv);
-
-  let extracted = "";
-  if (lower.endsWith(".eml") || file.mimetype === "message/rfc822") {
-    extracted = await parseEML(buf);
-  } else if (lower.endsWith(".msg") || file.filetype === "email") {
-    // Slackの filetype "email" は Outlook MSG にも使われることあり
-    extracted = await parseMSG(buf);
-  } else {
-    // 対応外 → そのまま断る（クレジット節約のため変換はしない）
-    extracted = `(対応外のファイルです) ${name}`;
-  }
-
-  const text = buildSlackTextBlock(extracted);
-
-  // 投稿先: 環境変数で固定されていればそれを使う。
-  // なければ元の共有チャンネル群へ（通常は file.channels に入る）
-  const destChannels =
-    TARGET_CHANNELS.length > 0 ? TARGET_CHANNELS : (file.channels || hintChannels || []);
-
-  const results = [];
-  for (const ch of destChannels) {
-    const r = await postToSlack({ channel: ch, thread_ts: file.shares?.public?.[ch]?.[0]?.ts, text });
-    results.push({ channel: ch, ok: r.ok, error: r.error });
-  }
-
-  await logBlob("posted", { fileId, name, channels: destChannels, results });
-  return results;
-}
-
-/** --------- 入口（Netlify Functions handler） --------- */
-export default async (req) => {
-  const rawBody = await req.text(); // 署名検証のため生ボディ
-  const ts = req.headers.get("x-slack-request-timestamp") || "";
-  const sig = req.headers.get("x-slack-signature") || "";
-
-  // URL verification (Slack UI に Request URL を設定したときの検証)
+// Main handler entry point for Netlify functions.  Note that Netlify
+// runs your function whenever Slack sends an event.  The function
+// must return a Response object.  Slack enforces a 3 second
+// response window; heavy work should complete quickly or Slack will
+// retry.
+export default async (req, context) => {
   try {
+    // Extract raw body.  Netlify’s req.text() returns the body as a
+    // string.  Preserve the raw body for signature verification.
+    const rawBody = await req.text();
+    const headers = req.headers;
+    const slackTimestamp = headers.get('x-slack-request-timestamp');
+    const slackSignature = headers.get('x-slack-signature');
+    // Verify Slack signature.  If verification fails, return 401.
+    const isValid = verifySlackSignature({ rawBody, timestamp: slackTimestamp, signature: slackSignature });
+    if (!isValid) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    // Parse the JSON payload.  Slack sends JSON encoded events.
     const body = JSON.parse(rawBody);
-    if (body && body.type === "url_verification" && body.challenge) {
-      return new Response(JSON.stringify({ challenge: body.challenge }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
+    // Slack URL verification challenge (during initial setup).  Echo
+    // back the challenge to confirm the endpoint.
+    if (body.type === 'url_verification' && body.challenge) {
+      return new Response(body.challenge, { status: 200 });
     }
-  } catch {
-    // noop
-  }
-
-  // 署名検証
-  if (!verifySlackSignature({ body: rawBody, timestamp: ts, signature: sig })) {
-    await logBlob("invalid-signature", { ts, sigPreview: sig?.slice(0, 10) });
-    return new Response("invalid signature", { status: 401 });
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch {
-    return new Response("bad request", { status: 400 });
-  }
-
-  // event_callback
-  if (payload.type === "event_callback") {
-    const ev = payload.event || {};
-
-    // 1) file_shared: ファイルが共有されたら本文抽出→投稿
-    if (ev.type === "file_shared" && ev.file_id) {
+    // If this is a test ping message (message event with text "ping")
+    // then respond with "pong" in the same channel.  This is
+    // convenient for smoke testing the function without uploading
+    // files.
+    if (body?.event?.type === 'message' && typeof body.event.text === 'string' && body.event.text.trim().toLowerCase() === 'ping') {
+      const channel = body.event.channel;
       try {
-        const results = await handleFileShared(ev.file_id, ev.channel ? [ev.channel] : []);
-        return json({ ok: true, results });
-      } catch (e) {
-        await logBlob("file_shared-error", { err: String(e) });
-        return json({ ok: false, error: String(e) }, 500);
+        await postMessage(channel, 'pong', body.event.thread_ts);
+      } catch (err) {
+        await logEvent('error', { error: err.message, event: body });
+      }
+      return new Response('OK', { status: 200 });
+    }
+    // We’re only interested in file_shared events.  Ignore other
+    // events to minimize unnecessary processing.
+    if (body?.event?.type !== 'file_shared') {
+      return new Response('ignored', { status: 200 });
+    }
+    const eventId = body.event_id || '';
+    // Deduplicate using event_id.  If Netlify Blobs logging is
+    // enabled, we’ll store a marker for each processed event.  If we
+    // see the same event again (due to Slack retries) we exit early.
+    if (LOG_TO_BLOBS && LOG_TO_BLOBS.toLowerCase() === 'true') {
+      try {
+        const store = getStore(BLOB_STORE_NAME || 'logs');
+        const existing = await store.get(`event-${eventId}`);
+        if (existing) {
+          return new Response('duplicate', { status: 200 });
+        }
+        await store.setJSON(`event-${eventId}`, { processedAt: new Date().toISOString() });
+      } catch (err) {
+        // Logging failure shouldn’t block processing.  Continue.
+        console.error('Failed to check/set dedupe key', err);
       }
     }
-
-    // 2) 手動テスト用: "ping" 等のメッセージに対し簡易応答（クレジット節約のため最低限）
-    if (ev.type === "message" && ev.text && ev.channel) {
-      if (/^ping$/i.test(ev.text.trim())) {
-        const r = await postToSlack({ channel: ev.channel, thread_ts: ev.ts, text: "```pong```" });
-        return json({ ok: r.ok });
+    // Fetch file information.  The file ID is provided in the event.
+    const fileId = body.event.file_id || body.event.file?.id;
+    if (!fileId) {
+      // Without a file ID we can’t proceed.  Log and return.
+      await logEvent('missing-file-id', { event: body });
+      return new Response('No file ID', { status: 200 });
+    }
+    // Call files.info to get details about the file, including its
+    // download URL.  The file may not be immediately available; if
+    // Slack returns error we log and exit.
+    const infoRes = await fetch(`https://slack.com/api/files.info?file=${encodeURIComponent(fileId)}`, {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` }
+    });
+    const infoJson = await infoRes.json();
+    if (!infoJson.ok) {
+      await logEvent('files-info-error', { error: infoJson.error, fileId });
+      return new Response('files.info error', { status: 200 });
+    }
+    const file = infoJson.file;
+    if (!file || !file.name) {
+      await logEvent('file-missing', { file });
+      return new Response('File missing', { status: 200 });
+    }
+    // Enforce file size limit.  Prevent very large files from being
+    // downloaded and parsed, which could exhaust memory or slow
+    // responses beyond Slack’s timeout window.
+    if (file.size && file.size > FILE_SIZE_LIMIT) {
+      const { channel, threadTs } = extractShareInfo(file);
+      const notice = `ファイルサイズが大きすぎるためプレビューできません（${(file.size / 1024 / 1024).toFixed(2)} MB）。元のファイルを参照してください。`;
+      if (channel) {
+        await postMessage(channel, notice, threadTs);
       }
-      // ファイル投稿とは無関係の通常メッセージはスルー
-      return json({ ok: true, skipped: true });
+      await logEvent('size-limit', { fileId, size: file.size });
+      return new Response('File too large', { status: 200 });
     }
-
-    // その他イベント
-    return json({ ok: true, ignored: ev.type });
-  }
-
-  // 3) テスト注入（手元テスト時のみ）：__test_base64_eml を受けたら Slack に投げず JSON を返す
-  try {
-    const t = JSON.parse(rawBody);
-    if (t.__test_base64_eml) {
-      const buf = Buffer.from(t.__test_base64_eml, "base64");
-      const txt = await parseEML(buf);
-      return json({ ok: true, preview: txt.slice(0, 300) });
+    // Determine the channel and thread for reply.  If the file
+    // hasn’t been shared to a channel and no TARGET_CHANNELS is set,
+    // bail out gracefully.
+    const { channel, threadTs } = extractShareInfo(file);
+    if (!channel) {
+      await logEvent('no-channel', { file });
+      return new Response('No channel', { status: 200 });
     }
-  } catch {
-    // noop
+    // Download the attachment using the private download URL.  Use the
+    // bot token for authorization.  We request as an ArrayBuffer to
+    // convert it into a Buffer.
+    const downloadRes = await fetch(file.url_private_download, {
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` }
+    });
+    if (!downloadRes.ok) {
+      await logEvent('download-error', { status: downloadRes.status, statusText: downloadRes.statusText, fileId });
+      return new Response('Download failed', { status: 200 });
+    }
+    const arrayBuffer = await downloadRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    // Parse the email content.  If parsing fails, catch and
+    // inform the user.
+    let emailText;
+    try {
+      emailText = await parseEmail(buffer, file.name);
+    } catch (err) {
+      const errorMsg = `ファイルの解析に失敗しました: ${err.message}`;
+      await postMessage(channel, errorMsg, threadTs);
+      await logEvent('parse-error', { error: err.message, file: file.name });
+      return new Response('Parse error', { status: 200 });
+    }
+    if (!emailText || emailText.trim().length === 0) {
+      const errorMsg = '本文が見つかりませんでした。元のファイルを参照してください。';
+      await postMessage(channel, errorMsg, threadTs);
+      await logEvent('empty-content', { file: file.name });
+      return new Response('Empty content', { status: 200 });
+    }
+    // Truncate long previews.  Slack code blocks have a maximum
+    // message length; additionally large messages impact display.
+    let preview = emailText;
+    if (preview.length > PREVIEW_LIMIT) {
+      preview = `${preview.slice(0, PREVIEW_LIMIT)}\n\n…（続きは元のファイルを参照してください）`;
+    }
+    // Wrap the preview in triple backticks to preserve formatting.  Use
+    // a code block rather than inline code to make multiline content
+    // readable.  Slack respects backtick fences inside messages.
+    const messageText = `\`\`\`\n${preview}\n\`\`\``;
+    await postMessage(channel, messageText, threadTs);
+    await logEvent('success', { file: file.name, channel, threadTs });
+    // Return OK so Slack doesn’t retry.  Note that all asynchronous
+    // operations above run within this single invocation; Netlify
+    // does not currently support background tasks in synchronous
+    // functions.  If Slack retries due to timeouts, our dedupe
+    // mechanism prevents duplicate replies.
+    return new Response('OK', { status: 200 });
+  } catch (err) {
+    // Catch-all error handler.  Log the error and respond with 500.
+    await logEvent('unhandled-exception', { error: err.message, stack: err.stack });
+    return new Response('Internal error', { status: 500 });
   }
-
-  return json({ ok: true, noop: true });
 };
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8" }
-  });
-}
