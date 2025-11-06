@@ -1,24 +1,11 @@
 [build]
-  # Install dependencies only (no build step) when deploying.  Using
-  # `npm ci` ensures the exact dependency versions defined in
-  # package‑lock.json are used on Netlify.
-  command = "npm ci"
+  command   = "npm ci"
   functions = "netlify/functions"
 
 [functions]
-  # Use esbuild for bundling Node functions.  Externalize large
-  # dependencies so they aren’t bundled into the function.  This keeps
-  # the deployed function small and reduces cold start times.
   node_bundler = "esbuild"
-  external_node_modules = [
-    "mailparser",
-    "html-to-text",
-    "msgreader",
-    "@netlify/blobs"
-  ]
+  # 大きめ依存は外部化してバンドルを軽量化
+  external_node_modules = ["mailparser", "html-to-text", "@kenjiuno/msgreader", "@netlify/blobs"]
 
 [build.environment]
-  # Pin the Node.js runtime to v20.  Slack’s SDK and msgreader both
-  # require Node ≥ 20 for stable ESM support.  This also avoids
-  # mismatches between the local environment and Netlify’s runtime.
   NODE_VERSION = "20"
