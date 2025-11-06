@@ -9,7 +9,6 @@
     "@netlify/blobs": "^8.1.0",
     "html-to-text": "^9.0.5",
     "mailparser": "^3.8.1",
-    "msgreader": "^1.12.0",
-    "node-fetch": "^3.3.2"
+    "msgreader": "^1.12.0"
   }
 }
