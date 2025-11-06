@@ -4,8 +4,7 @@
 
 [functions]
   node_bundler = "esbuild"
-  # 大きめ依存は外部化してバンドルを軽量化
-  external_node_modules = ["mailparser", "html-to-text", "@kenjiuno/msgreader", "@netlify/blobs"]
+  external_node_modules = ["mailparser","html-to-text","@kenjiuno/msgreader","@netlify/blobs"]
 
 [build.environment]
   NODE_VERSION = "20"
