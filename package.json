@@ -2,13 +2,11 @@
   "name": "eml-to-text-bot",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "dependencies": {
     "@netlify/blobs": "^8.1.0",
     "html-to-text": "^9.0.5",
     "mailparser": "^3.8.1",
-    "msgreader": "^1.12.0"
+    "@kenjiuno/msgreader": "^1.22.0"
   }
 }
