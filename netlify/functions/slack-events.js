@@ -3,8 +3,6 @@ import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
 import { getStore } from "@netlify/blobs";
 import { htmlToText } from "html-to-text";
-// ❌ ここでの静的 import はやめる
-// import MsgReader from "msgreader";
 
 const BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "";
 const SIGNING_SECRET = (process.env.SLACK_SIGNING_SECRET ?? "").trim();
@@ -36,7 +34,7 @@ async function postMessage({ channel, text, thread_ts }) {
       Authorization: `Bearer ${BOT_TOKEN}`,
       "Content-Type": "application/json; charset=utf-8",
     },
-    body: JSON.stringify({ channel, text, thread_ts }),
+    body: JSON.stringify({ channel, text, thread_ts, /* reply_broadcast: false (既定でfalse) */ }),
   });
   return r.json();
 }
@@ -62,11 +60,11 @@ function normalizeText(txt) {
 }
 
 async function parseEML(buf) {
+  const { simpleParser } = await import("mailparser");
   const mail = await simpleParser(buf);
   let body = "";
   if (mail.html) body = htmlToText(mail.html, { wordwrap: false });
   else if (mail.text) body = mail.text;
-
   const headerLines = [
     `From: ${mail.from?.text ?? ""}`,
     `To: ${mail.to?.text ?? ""}`,
@@ -74,12 +72,10 @@ async function parseEML(buf) {
     `Date: ${mail.date ?? ""}`,
     `Subject: ${mail.subject ?? ""}`,
   ].filter(Boolean);
-
   return `# ${mail.subject ?? ""}\n${headerLines.join("\n")}\n\n${body ?? ""}`;
 }
 
 async function parseMSG(buf) {
-  // 💡必要な時だけロード（.eml では読み込まないのでエラーを回避できる）
   const { default: MsgReader } = await import("@kenjiuno/msgreader");
   const reader = new MsgReader(buf);
   const info = reader.getFileData();
@@ -113,53 +109,78 @@ function isSupportedName(name = "") {
   return low.endsWith(".eml") || low.endsWith(".msg") || low.endsWith(".oft");
 }
 
+/** files.info の shares から channel と 親 ts を推定 */
+function resolveFromShares(file) {
+  const shares = file?.shares || {};
+  const areas = ["private", "public"];
+  for (const area of areas) {
+    const m = shares[area];
+    if (!m) continue;
+    for (const [cid, posts] of Object.entries(m)) {
+      if (Array.isArray(posts) && posts.length) {
+        const first = posts[0];
+        const ts = first.thread_ts || first.ts; // 親メッセージ ts
+        if (cid && ts) return { channel: cid, thread_ts: ts };
+      }
+    }
+  }
+  return { channel: null, thread_ts: null };
+}
+
 async function logBlob(path, data) {
   if (!LOG_TO_BLOBS || !store) return;
   try { await store.set(path, typeof data === "string" ? data : JSON.stringify(data)); } catch {}
 }
 
 async function handleFileShared(ev) {
-  const channel = ev.channel_id || ev.channel;
-  const thread_ts = ev.ts || ev.event_ts;
-
-  if (channel) {
-    await postMessage({ channel, thread_ts, text: "📎 `.eml/.msg` を検知。解析中…" });
-  }
-
+  // 1) file_id 抽出（両系統対応）
   const fileId =
     ev.file_id ||
     ev.file?.id ||
     (Array.isArray(ev.files) && ev.files[0]?.id) ||
     null;
-
   if (!fileId) throw new Error("no file_id");
 
+  // 2) files.info でチャンネル/親tsも含め情報取得
   const finfo = await filesInfo(fileId);
   if (!finfo.ok) throw new Error(`files.info failed: ${JSON.stringify(finfo)}`);
   const f = finfo.file;
 
+  // thread_ts と channel を厳密決定
+  const sharesRef = resolveFromShares(f);
+  const channel = ev.channel_id || ev.channel || sharesRef.channel;
+  // message.subtype=file_share なら ev.ts が“親”。file_shared は shares の ts を使う
+  const thread_ts = ev.ts || sharesRef.thread_ts || ev.event_ts;
+
+  if (!channel || !thread_ts) {
+    throw new Error("cannot resolve thread");
+  }
+
+  // 先にスレッドへだけ「解析中…」
+  await postMessage({ channel, thread_ts, text: "📎 `.eml/.msg` を検知。解析中…" });
+
+  // 3) サポート判定
   if (!isSupportedName(f.name)) {
-    if (channel) await postMessage({ channel, thread_ts, text: `⚠️ 未対応拡張子: \`${f.name}\`` });
+    await postMessage({ channel, thread_ts, text: `⚠️ 未対応の拡張子です: \`${f.name}\`（.eml/.msg/.oft）` });
     return;
   }
 
+  // 4) ダウンロード
   const url = f.url_private_download || f.url_private;
   if (!url) throw new Error("no url_private_download");
-
   const buf = await downloadPrivate(url);
 
+  // 5) 解析
   let parsed = "";
   const low = f.name.toLowerCase();
   if (low.endsWith(".eml")) parsed = await parseEML(buf);
   else if (low.endsWith(".msg")) parsed = await parseMSG(buf);
   else if (low.endsWith(".oft")) parsed = await parseOFT(buf);
 
+  // 6) 結果を“スレッドにのみ”投稿
   const body = normalizeText(parsed);
   const code = "```text\n" + body + "\n```";
-
-  if (channel) {
-    await postMessage({ channel, thread_ts, text: `🧾 解析結果（${f.name}）\n${code}` });
-  }
+  await postMessage({ channel, thread_ts, text: `🧾 解析結果（${f.name}）\n${code}` });
 }
 
 export default async function handler(req) {
@@ -201,9 +222,11 @@ export default async function handler(req) {
         await handleFileShared(ev);
       } catch (e) {
         await logBlob(`errors/handler/${Date.now()}`, { message: e?.message ?? String(e), ev });
-        const ch = ev.channel_id || ev.channel;
-        const th = ev.ts || ev.event_ts;
-        if (ch) await postMessage({ channel: ch, thread_ts: th, text: `❌ 解析失敗: ${e?.message ?? e}` });
+        const sharesCh = ev.channel_id || ev.channel;
+        const sharesTs = ev.ts || ev.event_ts;
+        if (sharesCh && sharesTs) {
+          await postMessage({ channel: sharesCh, thread_ts: sharesTs, text: `❌ 解析失敗: ${e?.message ?? e}` });
+        }
       }
       return new Response("", { status: 200 });
     }
