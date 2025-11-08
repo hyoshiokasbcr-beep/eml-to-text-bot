@@ -5,8 +5,8 @@
   "engines": { "node": ">=20" },
   "dependencies": {
     "@netlify/blobs": "^8.1.0",
+    "@kenjiuno/msgreader": "^1.12.4",
     "html-to-text": "^9.0.5",
-    "mailparser": "^3.8.1",
-    "@kenjiuno/msgreader": "^1.22.0"
+    "mailparser": "^3.8.1"
   }
 }
