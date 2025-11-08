@@ -1,14 +1,15 @@
 // netlify/functions/slack-events.js
-// ✅要件フル実装版
+// ✅要件フル実装＋OFTテンプレート自動判定版
 // - .eml/.msg/.oft 以外は完全スルー（返信なし）→ クレジット最小化
 // - file_shared のみ処理（message.subtype=file_share は無視）→ 二重投稿防止
 // - 重複防止キー: done:<fileId>:<channel>:<thread_ts>
 // - スレッドにのみ投稿（タイムラインに出さない）
 // - 1行プレビュー＋「全文を見る/プレビューに戻す」トグル（何度でもOK）
-// - コードブロックの言語ラベルなし（```text を使わない）
+// - コードブロックの言語ラベルなし（```text は使わない）
 // - .msg/.oft は必要時のみ動的 import（@kenjiuno/msgreader）
 // - 解析失敗時はスレッドに「❌ 解析失敗：...」を1行通知（軽量）
 // - ログは LOG_TO_BLOBS=true の時だけ Blobs に保存（開発/調査用）
+// - ★ .oft を自動判定：テンプレートっぽければ完全スルー、メールなら解析して表示
 
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
@@ -96,11 +97,38 @@ async function parseEML(buf) {
   ].filter(Boolean);
   return `# ${mail.subject ?? ""}\n${headerLines.join("\n")}\n\n${body ?? ""}`;
 }
-async function parseMSGorOFT(buf) {
-  // .msg/.oft は必要時のみロード（.eml では未読込）→ コスト削減
+
+/* ---- OFTテンプレート判定ロジック ---- */
+// MsgReader の出力（info）から「テンプレートっぽい」を判断する簡易ヒューリスティクス。
+// ※以下の条件のうち 3 つ以上合致したらテンプレート扱いにして完全スルー。
+function isLikelyTemplateOFT(info, bodyText) {
+  const recipientsEmpty = !Array.isArray(info.recipients) || info.recipients.length === 0;
+  const noDates = !info.messageDeliveryTime && !info.creationTime;
+  const noSender = !info.senderEmail && !info.senderName;
+  const subjectEmpty = !info.subject || String(info.subject).trim().length === 0;
+
+  const bt = (bodyText || "").replace(/\s+/g, " ").trim();
+  const bodyVeryShort = bt.length < 60; // ほぼ空
+  const hasTemplatePlaceholders = /{{.*?}}|<%.*?%>|\[\[.*?\]\]|\{.*?:.*?\}/.test(bt); // よくあるテンプレ占位
+  const mostlyHtmlShell = /^<!doctype|^<html[\s>]/i.test(bt) && bt.replace(/<[^>]+>/g, "").trim().length < 40;
+
+  let score = 0;
+  if (recipientsEmpty) score++;
+  if (noDates) score++;
+  if (noSender) score++;
+  if (subjectEmpty) score++;
+  if (bodyVeryShort) score++;
+  if (hasTemplatePlaceholders) score++;
+  if (mostlyHtmlShell) score++;
+
+  return score >= 3;
+}
+
+async function parseMSG(buf) {
   const { default: MsgReader } = await import("@kenjiuno/msgreader");
   const reader = new MsgReader(buf);
   const info = reader.getFileData();
+
   const html = info.bodyHTML ?? info.messageComps?.htmlBody ?? null;
   const rtf  = info.bodyRTF  ?? info.messageComps?.rtfBody  ?? null;
   const text = info.body     ?? info.messageComps?.plainText ?? null;
@@ -118,8 +146,47 @@ async function parseMSGorOFT(buf) {
     `Subject: ${info.subject || ""}`,
   ].filter(Boolean);
 
-  return `# ${info.subject || ""}\n${headerLines.join("\n")}\n\n${body || ""}`;
+  return {
+    isTemplate: false,
+    text: `# ${info.subject || ""}\n${headerLines.join("\n")}\n\n${body || ""}`,
+  };
 }
+
+async function parseOFTwithTemplateCheck(buf) {
+  const { default: MsgReader } = await import("@kenjiuno/msgreader");
+  const reader = new MsgReader(buf);
+  const info = reader.getFileData();
+
+  const html = info.bodyHTML ?? info.messageComps?.htmlBody ?? null;
+  const rtf  = info.bodyRTF  ?? info.messageComps?.rtfBody  ?? null;
+  const text = info.body     ?? info.messageComps?.plainText ?? null;
+
+  let body = "";
+  if (html) body = htmlToText(html, { wordwrap: false });
+  else if (text) body = text;
+  else if (rtf) body = rtf.replace(/\\[a-z]+\d* ?|[{}]/gi, " ").replace(/\s+/g, " ").trim();
+
+  // ★ テンプレ判定（本文＋メタ情報）
+  const template = isLikelyTemplateOFT(info, body);
+
+  if (template) {
+    return { isTemplate: true, text: "" }; // 完全スルーさせる
+  }
+
+  const headerLines = [
+    `From: ${info.senderName || info.senderEmail || ""}`,
+    `To: ${Array.isArray(info.recipients) ? info.recipients.map(r => r.name || r.email).join(", ") : ""}`,
+    info.cc ? `Cc: ${info.cc}` : null,
+    `Date: ${info.messageDeliveryTime || info.creationTime || ""}`,
+    `Subject: ${info.subject || ""}`,
+  ].filter(Boolean);
+
+  return {
+    isTemplate: false,
+    text: `# ${info.subject || ""}\n${headerLines.join("\n")}\n\n${body || ""}`,
+  };
+}
+
 function isSupportedName(name = "") {
   const low = name.toLowerCase();
   return low.endsWith(".eml") || low.endsWith(".msg") || low.endsWith(".oft");
@@ -192,13 +259,25 @@ async function handleFileShared(ev) {
   if (!url) return;
   const buf = await downloadPrivate(url);
 
-  // 解析
-  let parsed = "";
+  // 解析（.oft はテンプレ判定つき）
+  let parsedText = "";
   const low = f.name.toLowerCase();
-  if (low.endsWith(".eml")) parsed = await parseEML(buf);
-  else parsed = await parseMSGorOFT(buf);
 
-  const body = normalizeText(parsed);
+  if (low.endsWith(".eml")) {
+    parsedText = await parseEML(buf);
+  } else if (low.endsWith(".msg")) {
+    const r = await parseMSG(buf);
+    parsedText = r.text;
+  } else if (low.endsWith(".oft")) {
+    const r = await parseOFTwithTemplateCheck(buf);
+    if (r.isTemplate) {
+      // ★ テンプレートっぽい .oft は完全スルー（ユーザー通知なし）
+      return;
+    }
+    parsedText = r.text;
+  }
+
+  const body = normalizeText(parsedText);
 
   // データ保存：本文とファイル名を JSON で保持（トグル時に毎回取得できる）
   const dataKey = `p:${Date.now()}:${fileId}`;
