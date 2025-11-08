@@ -1,10 +1,7 @@
 [build]
-  command   = "npm ci"
+  command = "npm ci"
   functions = "netlify/functions"
 
 [functions]
   node_bundler = "esbuild"
-  external_node_modules = ["mailparser","html-to-text","@kenjiuno/msgreader","@netlify/blobs"]
-
-[build.environment]
-  NODE_VERSION = "20"
+  external_node_modules = ["mailparser", "@kenjiuno/msgreader", "html-to-text", "@netlify/blobs"]
