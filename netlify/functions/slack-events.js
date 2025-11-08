@@ -1,11 +1,14 @@
 // netlify/functions/slack-events.js
-// ✅改訂版：プレビュー↔全文を何度でもトグル可（content expired を解消）
-// - ボタンの value に一貫して “key” を持たせ、毎回その key で本文を取得
-// - PREVIEW_STORE には { body, filename } を JSON で保存
+// ✅要件フル実装版
 // - .eml/.msg/.oft 以外は完全スルー（返信なし）→ クレジット最小化
-// - file_shared のみ処理（message.subtype=file_share は無視）
-// - 重複防止: done:<fileId>:<channel>:<thread_ts>
-// - スレッドのみ返信、言語ラベル（text）非表示、msgreader は動的 import
+// - file_shared のみ処理（message.subtype=file_share は無視）→ 二重投稿防止
+// - 重複防止キー: done:<fileId>:<channel>:<thread_ts>
+// - スレッドにのみ投稿（タイムラインに出さない）
+// - 1行プレビュー＋「全文を見る/プレビューに戻す」トグル（何度でもOK）
+// - コードブロックの言語ラベルなし（```text を使わない）
+// - .msg/.oft は必要時のみ動的 import（@kenjiuno/msgreader）
+// - 解析失敗時はスレッドに「❌ 解析失敗：...」を1行通知（軽量）
+// - ログは LOG_TO_BLOBS=true の時だけ Blobs に保存（開発/調査用）
 
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
@@ -16,11 +19,11 @@ const BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "";
 const SIGNING_SECRET = (process.env.SLACK_SIGNING_SECRET ?? "").trim();
 const MAX_PREVIEW_CHARS = parseInt(process.env.MAX_PREVIEW_CHARS ?? "3000", 10);
 
-// 省エネ：ログは既定OFF
+// 省エネ：ログは既定OFF（必要時のみONに）
 const LOG_TO_BLOBS = (process.env.LOG_TO_BLOBS ?? "false").toLowerCase() === "true";
 const LOG_STORE = LOG_TO_BLOBS ? getStore({ name: process.env.BLOB_STORE_NAME || "logs" }) : null;
 
-// プレビュー/全文データ保存（低コスト）
+// プレビュー/全文データ保存（低コストの小容量データだけを保持）
 const PREVIEW_STORE = getStore({ name: process.env.PREVIEW_STORE_NAME || "previews" });
 
 /* -------------------- utils -------------------- */
@@ -94,7 +97,7 @@ async function parseEML(buf) {
   return `# ${mail.subject ?? ""}\n${headerLines.join("\n")}\n\n${body ?? ""}`;
 }
 async function parseMSGorOFT(buf) {
-  // .msg/.oft のみ読込（.eml の時は未読込）→ コスト削減
+  // .msg/.oft は必要時のみロード（.eml では未読込）→ コスト削減
   const { default: MsgReader } = await import("@kenjiuno/msgreader");
   const reader = new MsgReader(buf);
   const info = reader.getFileData();
@@ -138,7 +141,7 @@ function resolveFromShares(file) {
 }
 
 /* -------------------- Slack UI Blocks -------------------- */
-// 言語ラベルを出さないため ``` の後は空
+// 言語ラベルを出さないため ``` の後は空（```text を使わない）
 function blocksPreview(filename, preview, key) {
   return [
     {
@@ -184,7 +187,7 @@ async function handleFileShared(ev) {
   const doneKey = `done:${fileId}:${channel}:${thread_ts}`;
   if (await PREVIEW_STORE.get(doneKey)) return;
 
-  // ここから初めてダウンロード（対応拡張子のみ）→ 節約
+  // ここから初めてダウンロード（対応拡張子のみ）→ 省クレ
   const url = f.url_private_download || f.url_private;
   if (!url) return;
   const buf = await downloadPrivate(url);
@@ -197,7 +200,7 @@ async function handleFileShared(ev) {
 
   const body = normalizeText(parsed);
 
-  // データ保存：本文とファイル名を JSON で保持（何度でも開閉OK）
+  // データ保存：本文とファイル名を JSON で保持（トグル時に毎回取得できる）
   const dataKey = `p:${Date.now()}:${fileId}`;
   const data = { body, filename: f.name };
   await PREVIEW_STORE.set(dataKey, JSON.stringify(data));
@@ -222,12 +225,12 @@ async function handleBlockActions(payload) {
 
   // どちらのボタンも value に key を持たせている
   const key = action.value;
-  let raw = await PREVIEW_STORE.get(key);
+  const raw = await PREVIEW_STORE.get(key);
   if (!raw) {
-    // キーが無ければ終了（保存期間切れ時など）
+    // 保存切れ等。静かに終了（省クレ）。必要ならここで「データ期限切れ」通知も可。
     return new Response("", { status: 200 });
   }
-  // 文字列 or JSON 互換
+  // JSON or 文字列両対応
   let body = "";
   let filename = "メール本文";
   try {
@@ -258,7 +261,7 @@ export default async function handler(req) {
   const sig = req.headers.get("x-slack-signature");
   const contentType = req.headers.get("content-type") || "";
 
-  // Slack のリトライは即 200（処理を重ねない）
+  // Slackのリトライは即 200（処理を重ねない）
   if (req.headers.get("x-slack-retry-num")) {
     return new Response("", { status: 200, headers: { "X-Slack-No-Retry": "1" } });
   }
@@ -293,7 +296,7 @@ export default async function handler(req) {
   if (payload.type === "event_callback") {
     const ev = payload.event;
 
-    // diag（任意・省エネのため最小限）
+    // diag（任意）: スレッドに返す
     if (ev.type === "app_mention" && /diag/i.test(ev.text ?? "")) {
       if (ev.channel) await postMessage({ channel: ev.channel, thread_ts: ev.ts, text: "diag: ok ✅" });
       return new Response("", { status: 200 });
@@ -305,7 +308,18 @@ export default async function handler(req) {
         await handleFileShared(ev);
       } catch (e) {
         await logBlob(`errors/handler/${Date.now()}`, { message: e?.message ?? String(e) });
-        // 省クレ運用: ユーザーへのエラー返信はしない
+        // 軽量エラー通知（同じスレッドに1行だけ）
+        try {
+          const ch = ev.channel_id || ev.channel;
+          const th = ev.ts || ev.event_ts;
+          if (ch && th) {
+            await postMessage({
+              channel: ch,
+              thread_ts: th,
+              text: `❌ 解析失敗：${(e?.message ?? "unknown").slice(0, 100)}`
+            });
+          }
+        } catch {}
       }
       return new Response("", { status: 200 });
     }
