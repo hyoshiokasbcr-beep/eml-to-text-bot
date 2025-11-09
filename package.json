@@ -4,7 +4,6 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "dependencies": {
-    "msgreader": "^1.12.4",
     "@kenjiuno/msgreader": "^1.12.4",
     "mailparser": "^3.8.1",
     "html-to-text": "^9.0.5",
