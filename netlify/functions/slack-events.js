@@ -1,5 +1,12 @@
 // netlify/functions/slack-events.js
-// 最小堅牢版：プレビュー＋モーダル全文のみ / .msg互換強化 / 二重投稿撲滅（message.file_shareのみ処理）
+// 最小堅牢版（再修正版）:
+//  - .msg 解析の互換性を最大化（msgreader / @kenjiuno/msgreader を順に試す、default/named両対応）
+//  - Buffer→Uint8Array/ArrayBuffer 安全化
+//  - イベントは message.subtype=file_share のみ処理（重複撲滅）
+//  - スレッドは「1行プレビュー＋全文を見る（モーダル）」のみ（本文には出さない）
+//  - モーダル内に「📋 自分に送る（コピー用）」ボタン（DM送信）
+//  - コードブロックは言語ラベルなし（``` の後は空）
+// 必要スコープ: chat:write, files:read, channels:history, groups:history, app_mentions:read, (DM機能を使うなら) im:write
 
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
@@ -10,11 +17,11 @@ const BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "";
 const SIGNING_SECRET = (process.env.SLACK_SIGNING_SECRET ?? "").trim();
 const MAX_PREVIEW_CHARS = parseInt(process.env.MAX_PREVIEW_CHARS ?? "3000", 10);
 
-// 軽量ログ（任意）
+// 任意ログ
 const LOG_TO_BLOBS = (process.env.LOG_TO_BLOBS ?? "false").toLowerCase() === "true";
 const LOG_STORE = LOG_TO_BLOBS ? getStore({ name: process.env.BLOB_STORE_NAME || "logs" }) : null;
 
-// 本文一時保存＆ロック/フラグ管理
+// 本文保管 & ロック
 const PREVIEW_STORE = getStore({ name: process.env.PREVIEW_STORE_NAME || "previews" });
 
 /* ========= 共通 ========= */
@@ -30,7 +37,6 @@ function verifySlackSignature({ rawBody, timestamp, slackSig }) {
   hmac.update(base);
   return timingSafeEq(`v0=${hmac.digest("hex")}`, slackSig);
 }
-
 async function slackApi(path, payload) {
   const r = await fetch(`https://slack.com/api/${path}`, {
     method: "POST",
@@ -44,6 +50,9 @@ async function postMessage({ channel, text, thread_ts, blocks }) {
 }
 async function viewsOpen({ trigger_id, view }) {
   return slackApi("views.open", { trigger_id, view });
+}
+async function conversationsOpen(userId) {
+  return slackApi("conversations.open", { users: userId }); // 要: im:write
 }
 async function filesInfo(fileId) {
   const r = await fetch(`https://slack.com/api/files.info?file=${encodeURIComponent(fileId)}`, {
@@ -72,7 +81,6 @@ function firstLine(text) {
   const line = (text ?? "").split("\n").find(s => s.trim().length > 0) ?? "";
   return line.length > 120 ? (line.slice(0, 120) + " …") : (line || "(no content)");
 }
-
 async function parseEML(buf) {
   const mail = await simpleParser(buf);
   let body = "";
@@ -88,35 +96,48 @@ async function parseEML(buf) {
   return `# ${mail.subject ?? ""}\n${headerLines.join("\n")}\n\n${body ?? ""}`;
 }
 
-// Buffer/Uint8Array/ArrayBuffer の互換対応
+// Buffer/Uint8Array/ArrayBuffer 互換
 function toUint8Array(buf) {
   if (buf instanceof Uint8Array && !(buf instanceof Buffer)) return buf;
   return new Uint8Array(buf.buffer, buf.byteOffset ?? 0, buf.byteLength);
 }
-// ちょうどの ArrayBuffer を安全に作る（byteOffset考慮）
-function safeSliceArrayBuffer(u8) {
+function toTightArrayBuffer(u8) {
   const ab = new ArrayBuffer(u8.byteLength);
   new Uint8Array(ab).set(u8);
   return ab;
 }
 
+// MsgReader を確実に取得（msgreader → @kenjiuno/msgreader の順で試す、default/named両対応）
+async function loadMsgReaderCtor() {
+  // 1) unscoped "msgreader"
+  try {
+    const m = await import("msgreader");
+    const C = (typeof m?.default === "function") ? m.default : (typeof m?.MsgReader === "function" ? m.MsgReader : null);
+    if (typeof C === "function") return C;
+  } catch {}
+  // 2) scoped "@kenjiuno/msgreader"
+  try {
+    const m = await import("@kenjiuno/msgreader");
+    const C = (typeof m?.default === "function") ? m.default : (typeof m?.MsgReader === "function" ? m.MsgReader : null);
+    if (typeof C === "function") return C;
+  } catch {}
+  throw new Error("MsgReader constructor not found in both packages");
+}
+
 async function parseMSGorOFT(buf) {
-  const mod = await import("@kenjiuno/msgreader"); // robust import
-  const MsgReaderCtor = mod.MsgReader || mod.default;
-  if (typeof MsgReaderCtor !== "function") throw new Error("msgreader module not available");
+  const MsgReaderCtor = await loadMsgReaderCtor();
 
   const u8 = toUint8Array(buf);
-
   let info;
   try {
-    // 1) Uint8Array そのまま（多くの環境でOK）
-    const reader = new MsgReaderCtor(u8);
-    info = reader.getFileData();
+    // 1) Uint8Array
+    const r1 = new MsgReaderCtor(u8);
+    info = r1.getFileData();
   } catch (e1) {
     try {
-      // 2) ちょうどの ArrayBuffer を渡す（環境差吸収）
-      const reader2 = new MsgReaderCtor(safeSliceArrayBuffer(u8));
-      info = reader2.getFileData();
+      // 2) ちょうどの ArrayBuffer
+      const r2 = new MsgReaderCtor(toTightArrayBuffer(u8));
+      info = r2.getFileData();
     } catch (e2) {
       await logBlob(`errors/handler/${Date.now()}`, { kind: "msgreader-ctor", e1: String(e1), e2: String(e2) });
       throw new Error("failed to construct MsgReader");
@@ -155,7 +176,7 @@ function resolveFromShares(file) {
     for (const [cid, posts] of Object.entries(m)) {
       if (Array.isArray(posts) && posts.length) {
         const p = posts[0];
-        const ts = p.thread_ts || p.ts; // 親メッセージ ts
+        const ts = p.thread_ts || p.ts;
         if (cid && ts) return { channel: cid, thread_ts: ts };
       }
     }
@@ -164,7 +185,7 @@ function resolveFromShares(file) {
 }
 
 /* ========= Slack UI ========= */
-// プレビュー（1行）+ モーダルボタンのみ
+// プレビュー（1行）+ モーダルボタン
 function blocksPreview(filename, preview, payloadVal) {
   return [
     { type: "section",
@@ -174,24 +195,37 @@ function blocksPreview(filename, preview, payloadVal) {
     ]}
   ];
 }
+// モーダル（全文 + 自分に送る）
 function chunkText(s, n) { const out=[]; for (let i=0;i<s.length;i+=n) out.push(s.slice(i,i+n)); return out; }
-function buildModalView(filename, body) {
+function buildModalView(filename, body, meta) {
   const title = (filename || "解析結果").slice(0, 24);
   const chunks = chunkText(body, 2900);
   const blocks = chunks.length ? chunks.map(c => ({ type:"section", text:{ type:"mrkdwn", text:"```\n"+c+"\n```" } })) :
     [{ type:"section", text:{ type:"mrkdwn", text:"（内容なし）" } }];
-  return { type:"modal", title:{ type:"plain_text", text:title }, close:{ type:"plain_text", text:"閉じる" }, blocks };
+  blocks.push({
+    type: "actions",
+    elements: [
+      { type: "button", action_id: "send_copy_dm", text: { type: "plain_text", text: "📋 自分に送る（コピー用）" } }
+    ]
+  });
+  return {
+    type: "modal",
+    title: { type: "plain_text", text: title },
+    close: { type: "plain_text", text: "閉じる" },
+    private_metadata: JSON.stringify(meta || {}),
+    blocks
+  };
 }
 
 /* ========= メイン処理 ========= */
 async function handleFileSharedMessage(ev) {
-  // file_share（メッセージのサブタイプ）からだけ処理する
+  // message.subtype=file_share のみ処理（重複防止）
   const fileId = ev.files?.[0]?.id || ev.file?.id || ev.file_id || null;
   if (!fileId) throw new Error("no file_id");
 
-  // ロックで同時実行を抑止（粗いが実効性高）
+  // 簡易ロック
   const lockKey = `lock:${fileId}`;
-  if (await PREVIEW_STORE.get(lockKey)) return; // 既に処理中/済
+  if (await PREVIEW_STORE.get(lockKey)) return;
   await PREVIEW_STORE.set(lockKey, String(Date.now()));
 
   try {
@@ -224,12 +258,9 @@ async function handleFileSharedMessage(ev) {
     }
 
     const body = normalizeText(parsed);
-
-    // 本文保存（モーダル用）
     const key = `p:${Date.now()}:${fileId}`;
     await PREVIEW_STORE.set(key, body);
 
-    // プレビュー投下（本文には出さず、スレッドのみ）
     const preview = firstLine(body);
     await postMessage({
       channel,
@@ -238,8 +269,7 @@ async function handleFileSharedMessage(ev) {
       blocks: blocksPreview(f.name, preview, JSON.stringify({ key, filename: f.name })),
     });
   } finally {
-    // ロック解除（短命でもOK。厳密なTTLは不要）
-    await PREVIEW_STORE.set(lockKey, "done");
+    await PREVIEW_STORE.set(lockKey, "done"); // 短命でOK
   }
 }
 
@@ -254,7 +284,25 @@ async function handleBlockActions(payload) {
     const key = val?.key, filename = val?.filename || "解析結果";
     if (!trigger_id || !key) return new Response("", { status: 200 });
     const body = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
-    await viewsOpen({ trigger_id, view: buildModalView(filename, body) });
+    await viewsOpen({ trigger_id, view: buildModalView(filename, body, { key, filename }) });
+    return new Response("", { status: 200 });
+  }
+
+  if (action.action_id === "send_copy_dm") {
+    // モーダル内ボタン：自分のDMに全文を送る（コピー用）
+    const userId = payload.user?.id;
+    const meta = payload.view?.private_metadata ? JSON.parse(payload.view.private_metadata) : {};
+    const key = meta.key, filename = meta.filename || "解析結果";
+    if (!userId || !key) return new Response("", { status: 200 });
+
+    const content = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
+    const opened = await conversationsOpen(userId); // 要: im:write
+    if (opened?.ok && opened?.channel?.id) {
+      const dmId = opened.channel.id;
+      await postMessage({ channel: dmId, text: `🧾 解析結果（${filename}）\n\`\`\`\n${content}\n\`\`\`` });
+    } else {
+      await logBlob(`errors/handler/${Date.now()}`, { kind: "open-dm-failed", opened });
+    }
     return new Response("", { status: 200 });
   }
 
@@ -268,7 +316,7 @@ export default async function handler(req) {
   const sig = req.headers.get("x-slack-signature");
   const contentType = req.headers.get("content-type") || "";
 
-  // Slackのリトライは即 200 で打ち止め
+  // Slack リトライは即打ち止め
   if (req.headers.get("x-slack-retry-num")) {
     return new Response("", { status: 200, headers: { "X-Slack-No-Retry": "1" } });
   }
@@ -278,7 +326,7 @@ export default async function handler(req) {
     return new Response("invalid signature", { status: 401 });
   }
 
-  // Interactivity: x-www-form-urlencoded
+  // Interactivity
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const m = /^payload=(.*)$/.exec(raw);
     if (!m) return new Response("", { status: 200 });
@@ -308,7 +356,7 @@ export default async function handler(req) {
       return new Response("", { status: 200 });
     }
 
-    // ✅ ここが重要：message.subtype=file_share だけ処理する（重複防止）
+    // ✅ message.subtype=file_share のみ処理（重複撲滅）
     if (ev.type === "message" && ev.subtype === "file_share") {
       try {
         await handleFileSharedMessage(ev);
