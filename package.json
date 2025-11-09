@@ -4,9 +4,10 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "dependencies": {
-    "@netlify/blobs": "^8.1.0",
+    "msgreader": "^1.12.4",
     "@kenjiuno/msgreader": "^1.12.4",
+    "mailparser": "^3.8.1",
     "html-to-text": "^9.0.5",
-    "mailparser": "^3.8.1"
+    "@netlify/blobs": "^8.1.0"
   }
 }
