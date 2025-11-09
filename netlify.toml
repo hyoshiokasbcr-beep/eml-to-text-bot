@@ -4,4 +4,4 @@
 
 [functions]
   node_bundler = "esbuild"
-  external_node_modules = ["msgreader","@kenjiuno/msgreader","mailparser","html-to-text","@netlify/blobs"]
+  external_node_modules = ["@kenjiuno/msgreader","mailparser","html-to-text","@netlify/blobs"]
