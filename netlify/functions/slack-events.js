@@ -1,11 +1,5 @@
 // netlify/functions/slack-events.js
-// ハイブリッド版：
-//  - スレッドに「1行プレビュー」+ ボタン2つ
-//      1) 「全文を見る」→ モーダルで開閉（開く=1API/閉じる=0）※省クレジット＆モバイル配慮
-//      2) 「スレッドに全文を投稿」→ そのスレッドに1回だけ全文を恒久投稿（検索しやすい）
-//  - 二重投稿防止（Slack再送 & 同一ファイルイベント）
-//  - .msg/.oft対応（MsgReaderのexport差とUint8Array化に対応）
-//  - コードブロックの言語ラベルは空（``` の後に言語名を書かない）
+// 最小堅牢版：プレビュー＋モーダル全文のみ / .msg互換強化 / 二重投稿撲滅（message.file_shareのみ処理）
 
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
@@ -20,10 +14,10 @@ const MAX_PREVIEW_CHARS = parseInt(process.env.MAX_PREVIEW_CHARS ?? "3000", 10);
 const LOG_TO_BLOBS = (process.env.LOG_TO_BLOBS ?? "false").toLowerCase() === "true";
 const LOG_STORE = LOG_TO_BLOBS ? getStore({ name: process.env.BLOB_STORE_NAME || "logs" }) : null;
 
-// 本文一時保存＆フラグ管理
+// 本文一時保存＆ロック/フラグ管理
 const PREVIEW_STORE = getStore({ name: process.env.PREVIEW_STORE_NAME || "previews" });
 
-/* ============ 共通 ============ */
+/* ========= 共通 ========= */
 function timingSafeEq(a, b) {
   const ab = Buffer.from(a), bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
@@ -48,9 +42,6 @@ async function slackApi(path, payload) {
 async function postMessage({ channel, text, thread_ts, blocks }) {
   return slackApi("chat.postMessage", { channel, text, thread_ts, blocks });
 }
-async function updateMessage({ channel, ts, text, blocks }) {
-  return slackApi("chat.update", { channel, ts, text, blocks });
-}
 async function viewsOpen({ trigger_id, view }) {
   return slackApi("views.open", { trigger_id, view });
 }
@@ -71,7 +62,7 @@ async function logBlob(path, data) {
   try { await LOG_STORE.set(path, typeof data === "string" ? data : JSON.stringify(data)); } catch {}
 }
 
-/* ============ 解析 ============ */
+/* ========= 解析 ========= */
 function normalizeText(txt) {
   const clean = (txt ?? "").replace(/\r\n/g, "\n").replace(/\t/g, "  ").trim();
   if (clean.length <= MAX_PREVIEW_CHARS) return clean;
@@ -97,16 +88,40 @@ async function parseEML(buf) {
   return `# ${mail.subject ?? ""}\n${headerLines.join("\n")}\n\n${body ?? ""}`;
 }
 
+// Buffer/Uint8Array/ArrayBuffer の互換対応
 function toUint8Array(buf) {
   if (buf instanceof Uint8Array && !(buf instanceof Buffer)) return buf;
   return new Uint8Array(buf.buffer, buf.byteOffset ?? 0, buf.byteLength);
 }
+// ちょうどの ArrayBuffer を安全に作る（byteOffset考慮）
+function safeSliceArrayBuffer(u8) {
+  const ab = new ArrayBuffer(u8.byteLength);
+  new Uint8Array(ab).set(u8);
+  return ab;
+}
+
 async function parseMSGorOFT(buf) {
-  const mod = await import("@kenjiuno/msgreader"); // robust: default/named両対応
+  const mod = await import("@kenjiuno/msgreader"); // robust import
   const MsgReaderCtor = mod.MsgReader || mod.default;
   if (typeof MsgReaderCtor !== "function") throw new Error("msgreader module not available");
-  const reader = new MsgReaderCtor(toUint8Array(buf));
-  const info = reader.getFileData();
+
+  const u8 = toUint8Array(buf);
+
+  let info;
+  try {
+    // 1) Uint8Array そのまま（多くの環境でOK）
+    const reader = new MsgReaderCtor(u8);
+    info = reader.getFileData();
+  } catch (e1) {
+    try {
+      // 2) ちょうどの ArrayBuffer を渡す（環境差吸収）
+      const reader2 = new MsgReaderCtor(safeSliceArrayBuffer(u8));
+      info = reader2.getFileData();
+    } catch (e2) {
+      await logBlob(`errors/handler/${Date.now()}`, { kind: "msgreader-ctor", e1: String(e1), e2: String(e2) });
+      throw new Error("failed to construct MsgReader");
+    }
+  }
 
   const html = info.bodyHTML ?? info.messageComps?.htmlBody ?? null;
   const rtf  = info.bodyRTF  ?? info.messageComps?.rtfBody  ?? null;
@@ -148,19 +163,17 @@ function resolveFromShares(file) {
   return { channel: null, thread_ts: null };
 }
 
-/* ============ Slack UI ============ */
-// プレビュー（1行）+ 2ボタン
+/* ========= Slack UI ========= */
+// プレビュー（1行）+ モーダルボタンのみ
 function blocksPreview(filename, preview, payloadVal) {
   return [
     { type: "section",
       text: { type: "mrkdwn", text: `🧾 解析結果（${filename}）\n\`\`\`\n${preview}\n\`\`\`` } },
     { type: "actions", elements: [
-      { type: "button", text: { type: "plain_text", text: "全文を見る（モーダル）" }, action_id: "open_modal", value: payloadVal },
-      { type: "button", text: { type: "plain_text", text: "スレッドに全文を投稿" }, action_id: "post_full_once", value: payloadVal, style: "primary" }
+      { type: "button", text: { type: "plain_text", text: "全文を見る（モーダル）" }, action_id: "open_modal", value: payloadVal }
     ]}
   ];
 }
-// モーダル（全文）
 function chunkText(s, n) { const out=[]; for (let i=0;i<s.length;i+=n) out.push(s.slice(i,i+n)); return out; }
 function buildModalView(filename, body) {
   const title = (filename || "解析結果").slice(0, 24);
@@ -170,121 +183,85 @@ function buildModalView(filename, body) {
   return { type:"modal", title:{ type:"plain_text", text:title }, close:{ type:"plain_text", text:"閉じる" }, blocks };
 }
 
-/* ============ メイン処理 ============ */
-async function handleFileShared(ev) {
-  const fileId = ev.file_id || ev.file?.id || (Array.isArray(ev.files) && ev.files[0]?.id) || null;
+/* ========= メイン処理 ========= */
+async function handleFileSharedMessage(ev) {
+  // file_share（メッセージのサブタイプ）からだけ処理する
+  const fileId = ev.files?.[0]?.id || ev.file?.id || ev.file_id || null;
   if (!fileId) throw new Error("no file_id");
 
-  // 同一ファイル二重イベント防止
-  const doneKey = `done:${fileId}`;
-  if (await PREVIEW_STORE.get(doneKey)) return;
+  // ロックで同時実行を抑止（粗いが実効性高）
+  const lockKey = `lock:${fileId}`;
+  if (await PREVIEW_STORE.get(lockKey)) return; // 既に処理中/済
+  await PREVIEW_STORE.set(lockKey, String(Date.now()));
 
-  const finfo = await filesInfo(fileId);
-  if (!finfo.ok) throw new Error(`files.info failed: ${JSON.stringify(finfo)}`);
-  const f = finfo.file;
+  try {
+    const finfo = await filesInfo(fileId);
+    if (!finfo.ok) throw new Error(`files.info failed: ${JSON.stringify(finfo)}`);
+    const f = finfo.file;
 
-  const sharesRef = resolveFromShares(f);
-  const channel = ev.channel_id || ev.channel || sharesRef.channel;
-  const thread_ts = ev.ts || sharesRef.thread_ts || ev.event_ts;
-  if (!channel || !thread_ts) throw new Error("cannot resolve thread");
+    const sharesRef = resolveFromShares(f);
+    const channel = ev.channel || ev.channel_id || sharesRef.channel;
+    const thread_ts = ev.ts || sharesRef.thread_ts || ev.event_ts;
+    if (!channel || !thread_ts) throw new Error("cannot resolve thread");
 
-  if (!isSupportedName(f.name)) {
-    await postMessage({ channel, thread_ts, text: `⚠️ 未対応の拡張子です: \`${f.name}\`（.eml/.msg/.oft）` });
-    return;
+    if (!isSupportedName(f.name)) {
+      await postMessage({ channel, thread_ts, text: `⚠️ 未対応の拡張子です: \`${f.name}\`（.eml/.msg/.oft）` });
+      return;
+    }
+
+    const url = f.url_private_download || f.url_private;
+    if (!url) throw new Error("no url_private_download");
+    const buf = await downloadPrivate(url);
+
+    let parsed = "";
+    const low = f.name.toLowerCase();
+    try {
+      if (low.endsWith(".eml")) parsed = await parseEML(buf);
+      else parsed = await parseMSGorOFT(buf);
+    } catch (e) {
+      await logBlob(`errors/handler/${Date.now()}`, { kind: "parse-failed", name: f.name, e: String(e) });
+      throw new Error("parse failed");
+    }
+
+    const body = normalizeText(parsed);
+
+    // 本文保存（モーダル用）
+    const key = `p:${Date.now()}:${fileId}`;
+    await PREVIEW_STORE.set(key, body);
+
+    // プレビュー投下（本文には出さず、スレッドのみ）
+    const preview = firstLine(body);
+    await postMessage({
+      channel,
+      thread_ts,
+      text: "解析結果（プレビュー）",
+      blocks: blocksPreview(f.name, preview, JSON.stringify({ key, filename: f.name })),
+    });
+  } finally {
+    // ロック解除（短命でもOK。厳密なTTLは不要）
+    await PREVIEW_STORE.set(lockKey, "done");
   }
-
-  const url = f.url_private_download || f.url_private;
-  if (!url) throw new Error("no url_private_download");
-  const buf = await downloadPrivate(url);
-
-  let parsed = "";
-  const low = f.name.toLowerCase();
-  if (low.endsWith(".eml")) parsed = await parseEML(buf);
-  else parsed = await parseMSGorOFT(buf);
-
-  const body = normalizeText(parsed);
-
-  // 保存 & フラグ
-  const key = `p:${Date.now()}:${fileId}`;
-  await PREVIEW_STORE.set(key, body);
-  await PREVIEW_STORE.set(doneKey, "1");
-
-  // プレビュー投下（本文は出さず、スレッドのみ）
-  const preview = firstLine(body);
-  await postMessage({
-    channel,
-    thread_ts,
-    text: "解析結果（プレビュー）",
-    blocks: blocksPreview(f.name, preview, JSON.stringify({ key, filename: f.name, channel, thread_ts })),
-  });
 }
 
-/* ============ インタラクション ============ */
+/* ========= インタラクション ========= */
 async function handleBlockActions(payload) {
   const action = payload?.actions?.[0];
   if (!action) return new Response("", { status: 200 });
 
-  // payload 共通
-  const trigger_id = payload.trigger_id;
-  const actionVal = action.value ? JSON.parse(action.value) : {};
-  const key = actionVal.key;
-  const filename = actionVal.filename || "解析結果";
-  const originChannel = actionVal.channel;
-  const originThreadTs = actionVal.thread_ts;
-
   if (action.action_id === "open_modal") {
+    const trigger_id = payload.trigger_id;
+    const val = action.value ? JSON.parse(action.value) : null;
+    const key = val?.key, filename = val?.filename || "解析結果";
     if (!trigger_id || !key) return new Response("", { status: 200 });
     const body = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
-    const view = buildModalView(filename, body);
-    await viewsOpen({ trigger_id, view });
-    return new Response("", { status: 200 });
-  }
-
-  if (action.action_id === "post_full_once") {
-    // 1スレッド1回だけ恒久投稿（検索向け）。二重防止フラグで制御。
-    if (!originChannel || !originThreadTs || !key) return new Response("", { status: 200 });
-    const postFlagKey = `posted:${originChannel}:${originThreadTs}`;
-    if (await PREVIEW_STORE.get(postFlagKey)) {
-      // すでに投稿済みなら、ボタンだけ無効化（任意）
-      const ts = payload.message?.ts;
-      if (ts) {
-        // ボタンをグレーアウトに差し替え
-        const preview = firstLine((await PREVIEW_STORE.get(key)) ?? "");
-        const blocks = [
-          { type:"section", text:{ type:"mrkdwn", text:`🧾 解析結果（${filename}）\n\`\`\`\n${preview}\n\`\`\`` } },
-          { type:"context", elements:[ { type:"mrkdwn", text:"✅ このスレッドにはすでに全文を投稿済みです" } ] }
-        ];
-        await updateMessage({ channel: originChannel, ts, text:"解析結果（プレビュー）", blocks });
-      }
-      return new Response("", { status: 200 });
-    }
-
-    const body = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
-    const code = "```\n" + body + "\n```";
-    await postMessage({
-      channel: originChannel,
-      thread_ts: originThreadTs, // スレッドに恒久投稿
-      text: `🧾 解析結果（全文） — ${filename}\n${code}`
-    });
-    await PREVIEW_STORE.set(postFlagKey, "1");
-
-    // 押した元メッセージのボタンを「投稿済み」表示に更新（任意）
-    const ts = payload.message?.ts;
-    if (ts) {
-      const preview = firstLine(body);
-      const blocks = [
-        { type:"section", text:{ type:"mrkdwn", text:`🧾 解析結果（${filename}）\n\`\`\`\n${preview}\n\`\`\`` } },
-        { type:"context", elements:[ { type:"mrkdwn", text:"✅ このスレッドに全文を投稿しました（1回だけ）" } ] }
-      ];
-      await updateMessage({ channel: originChannel, ts, text:"解析結果（プレビュー）", blocks });
-    }
+    await viewsOpen({ trigger_id, view: buildModalView(filename, body) });
     return new Response("", { status: 200 });
   }
 
   return new Response("", { status: 200 });
 }
 
-/* ============ エントリーポイント ============ */
+/* ========= エントリーポイント ========= */
 export default async function handler(req) {
   const raw = await req.text();
   const ts = req.headers.get("x-slack-request-timestamp");
@@ -301,7 +278,7 @@ export default async function handler(req) {
     return new Response("invalid signature", { status: 401 });
   }
 
-  // Interactivity: x-www-form-urlencoded（payload=...）
+  // Interactivity: x-www-form-urlencoded
   if (contentType.includes("application/x-www-form-urlencoded")) {
     const m = /^payload=(.*)$/.exec(raw);
     if (!m) return new Response("", { status: 200 });
@@ -325,20 +302,27 @@ export default async function handler(req) {
   if (payload.type === "event_callback") {
     const ev = payload.event;
 
+    // diag
     if (ev.type === "app_mention" && /diag/i.test(ev.text ?? "")) {
       if (ev.channel) await postMessage({ channel: ev.channel, thread_ts: ev.ts, text: "diag: ok ✅" });
       return new Response("", { status: 200 });
     }
 
-    if (ev.type === "file_shared" || ev.subtype === "file_share") {
+    // ✅ ここが重要：message.subtype=file_share だけ処理する（重複防止）
+    if (ev.type === "message" && ev.subtype === "file_share") {
       try {
-        await handleFileShared(ev);
+        await handleFileSharedMessage(ev);
       } catch (e) {
-        await logBlob(`errors/handler/${Date.now()}`, { message: e?.message ?? String(e) });
-        const ch = ev.channel_id || ev.channel;
-        const th = ev.ts || ev.event_ts;
+        await logBlob(`errors/handler/${Date.now()}`, { message: e?.message ?? String(e), evType: "message.file_share" });
+        const ch = ev.channel;
+        const th = ev.ts;
         if (ch && th) await postMessage({ channel: ch, thread_ts: th, text: `❌ 解析失敗: ${e?.message ?? e}` });
       }
+      return new Response("", { status: 200 });
+    }
+
+    // ❌ file_shared は完全スキップ（200返却のみ）
+    if (ev.type === "file_shared") {
       return new Response("", { status: 200 });
     }
   }
