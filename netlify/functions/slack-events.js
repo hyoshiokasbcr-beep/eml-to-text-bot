@@ -9,6 +9,8 @@
 // ★ C案対応：
 //   - Slack 側：message.channels / message.groups は購読解除して OK
 //   - コード側：ev.type === "message" は一切処理せず、file_shared と app_mention だけ見る
+// ★ 今回の修正：file_shared 時には threadHint を渡さず、
+//   files.info の shares から正しい thread_ts を取得してスレッド返信にする。
 //
 // 環境変数：
 // SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, MAX_PREVIEW_CHARS,
@@ -224,7 +226,6 @@ function supported(name = "") {
 
 /* ─ UI ─ */
 function blocksPreview(filename, preview, payload) {
-  // B案：左に「全文を見る」、右に「削除」（danger）
   return [
     {
       type: "section",
@@ -344,12 +345,12 @@ async function handleFileById({
   if (!fileId) return;
 
   const lock = `lock:${fileId}`;
-  if (await PREVIEW_STORE.get(lock)) return; // すでに誰かが開始
+  if (await PREVIEW_STORE.get(lock)) return;
   await PREVIEW_STORE.set(lock, String(Date.now()));
 
   try {
-    if (await PREVIEW_STORE.get(`done:${fileId}`)) return; // 完了済みなら抜ける
-    if (await PREVIEW_STORE.get(`processing:${fileId}`)) return; // 実行中なら抜ける
+    if (await PREVIEW_STORE.get(`done:${fileId}`)) return;
+    if (await PREVIEW_STORE.get(`processing:${fileId}`)) return;
 
     const f = await filesInfoWithShares(fileId, 6, 700);
     if (!supported(f.name)) {
@@ -357,15 +358,16 @@ async function handleFileById({
       return;
     }
 
-    let channel = channelHint;
+    let channel   = channelHint;
     let thread_ts = threadHint;
+
+    // channel / thread_ts が足りなければ shares から補完
     if (!channel || !thread_ts) {
       const r = placeFromShares(f);
-      channel = channel || r.channel;
+      channel   = channel   || r.channel;
       thread_ts = thread_ts || r.thread_ts;
     }
 
-    // strictThread:true（file_shared）では thread 不明なら何もせず撤退
     if (strictThread && (!channel || !thread_ts)) {
       return;
     }
@@ -374,7 +376,7 @@ async function handleFileById({
       return;
     }
 
-    await PREVIEW_STORE.set(`processing:${fileId}`, "1"); // 投稿直前で立てる
+    await PREVIEW_STORE.set(`processing:${fileId}`, "1");
 
     const url = f.url_private_download || f.url_private;
     if (!url) {
@@ -382,15 +384,13 @@ async function handleFileById({
       return;
     }
 
-    const buf = await dl(url);
-
+    const buf   = await dl(url);
     const isEml = f.name.toLowerCase().endsWith(".eml");
     let parsed;
 
     try {
       parsed = isEml ? await parseEML(buf) : await parseMSGorOFT(buf);
     } catch (err) {
-      // MSG/OFT のときだけフォールバックで頑張る
       if (!isEml) {
         const fallback = fallbackExtractTextFromMsgBuffer(buf);
         parsed =
@@ -405,7 +405,6 @@ async function handleFileById({
       }
     }
 
-    // 会議通知MSGは解析せず「対象外」とだけ投稿
     if (parsed === "__SKIP_MEETING_MSG__") {
       await post({
         channel,
@@ -420,8 +419,7 @@ async function handleFileById({
     const key  = `p:${Date.now()}:${fileId}`;
     await PREVIEW_STORE.set(key, body);
 
-    // 投稿者（削除権限判定用）：イベント側のヒント or file.user
-    const owner = ownerHint || f.user || null;
+    const owner   = ownerHint || f.user || null;
     const payload = JSON.stringify({ key, filename: f.name, owner });
 
     const preview = firstLine(body);
@@ -432,7 +430,7 @@ async function handleFileById({
       blocks: blocksPreview(f.name, preview, payload),
     });
 
-    await PREVIEW_STORE.set(`done:${fileId}`, "1"); // 完了
+    await PREVIEW_STORE.set(`done:${fileId}`, "1");
   } finally {
     await PREVIEW_STORE.set(`processing:${fileId}`, "0").catch(() => {});
     await PREVIEW_STORE.set(lock, "done").catch(() => {});
@@ -462,7 +460,6 @@ async function handleBlockActions(payload) {
     const channel  = payload.channel?.id || payload.container?.channel_id;
     const msgTs    = payload.message?.ts || payload.container?.message_ts;
 
-    // モーダルを開く
     if (a.action_id === "open_modal") {
       if (!payload.trigger_id || !key) return new Response("", { status: 200 });
       const body = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
@@ -473,7 +470,6 @@ async function handleBlockActions(payload) {
       return new Response("", { status: 200 });
     }
 
-    // プレビュー削除（投稿者だけ）
     if (a.action_id === "delete_preview") {
       if (!userId || !channel || !msgTs) return new Response("", { status: 200 });
       if (owner && owner !== userId) {
@@ -489,16 +485,15 @@ async function handleBlockActions(payload) {
       return new Response("", { status: 200 });
     }
 
-    // DM にコピー
     if (a.action_id === "send_copy_dm" && ENABLE_DM_COPY) {
       const meta = payload.view?.private_metadata
         ? JSON.parse(payload.view.private_metadata)
         : {};
-      const mKey = meta.key;
+      const mKey      = meta.key;
       const mFilename = meta.filename || "解析結果";
-      const uid  = payload.user?.id;
+      const uid       = payload.user?.id;
       if (!uid || !mKey) return new Response("", { status: 200 });
-      const body = (await PREVIEW_STORE.get(mKey)) ?? "(content expired)";
+      const body   = (await PREVIEW_STORE.get(mKey)) ?? "(content expired)";
       const opened = await openDM(uid);
       if (opened?.ok && opened?.channel?.id) {
         await post({
@@ -532,7 +527,6 @@ export default async function handler(req) {
     return new Response("invalid signature", { status: 401 });
   }
 
-  // Interactivity: x-www-form-urlencoded で payload=... が来る
   if (ct.includes("application/x-www-form-urlencoded")) {
     const m = /(^|&)payload=([^&]*)/.exec(raw);
     if (!m) return new Response("", { status: 200 });
@@ -548,7 +542,6 @@ export default async function handler(req) {
     return new Response("", { status: 200 });
   }
 
-  // Events API
   let payload;
   try {
     payload = JSON.parse(raw);
@@ -568,28 +561,28 @@ export default async function handler(req) {
   if (payload.type === "event_callback") {
     const ev = payload.event;
 
-    // diag: @bot diag
     if (ev.type === "app_mention" && /diag/i.test(ev.text ?? "")) {
-      if (ev.channel)
+      if (ev.channel) {
         await post({
           channel: ev.channel,
           thread_ts: ev.ts,
           text: "diag: ok ✅",
         });
+      }
       return new Response("", { status: 200 });
     }
 
-    // ★ C案：message.* は一切処理しない（Slack 側でも購読解除推奨）
+    // C案：message.* は完全無視
     if (ev.type === "message") {
       return new Response("", { status: 200 });
     }
 
-    // file_shared だけ処理
+    // file_shared だけ処理（★ threadHint は渡さない）
     if (ev.type === "file_shared") {
       await handleFileById({
         fileId: ev.file_id,
         channelHint: ev.channel_id || null,
-        threadHint: ev.event_ts || undefined,
+        threadHint: undefined,   // ここがポイント：shares から正しい thread_ts を取る
         strictThread: true,
         ownerHint: ev.user_id || null,
       });
