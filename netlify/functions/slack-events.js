@@ -6,13 +6,14 @@
 // ・壊れた .msg    → バイトスキャンでフォールバック（保険文付き）
 // ・会議通知の .msg → 「解析対象外です」とだけスレッドに投稿（本文解析なし）
 //
-// ★ 修正ポイント：
-//   - スレッド内のメッセージにファイルが添付された場合、
-//     ev.thread_ts（スレッドの親）を優先して thread_ts として返信
+// ★ C案対応：
+//   - Slack 側：message.channels / message.groups は購読解除して OK
+//   - コード側：ev.type === "message" は一切処理せず、file_shared と app_mention だけ見る
 //
 // 環境変数：
-// SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, MAX_PREVIEW_CHARS, ENABLE_DM_COPY, LOG_TO_BLOBS,
-// DEBUG_MODE, PREVIEW_STORE_NAME, BLOB_STORE_NAME
+// SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, MAX_PREVIEW_CHARS,
+// ENABLE_DM_COPY, LOG_TO_BLOBS, DEBUG_MODE,
+// PREVIEW_STORE_NAME, BLOB_STORE_NAME
 
 import crypto from "node:crypto";
 import { simpleParser } from "mailparser";
@@ -223,7 +224,7 @@ function supported(name = "") {
 
 /* ─ UI ─ */
 function blocksPreview(filename, preview, payload) {
-  // B案イメージ：左に「全文を見る」、右側に「削除」（危険色）
+  // B案：左に「全文を見る」、右に「削除」（danger）
   return [
     {
       type: "section",
@@ -332,7 +333,7 @@ function placeFromShares(file) {
   return { channel: null, thread_ts: null };
 }
 
-/* ─ core（重複防止：lock + processing + done / file_sharedは厳格） ─ */
+/* ─ core（file_shared only / 重複防止） ─ */
 async function handleFileById({
   fileId,
   channelHint,
@@ -364,7 +365,7 @@ async function handleFileById({
       thread_ts = thread_ts || r.thread_ts;
     }
 
-    // strictThread（file_shared）では thread 不明なら何もせず撤退（本編には投稿しない）
+    // strictThread:true（file_shared）では thread 不明なら何もせず撤退
     if (strictThread && (!channel || !thread_ts)) {
       return;
     }
@@ -373,7 +374,7 @@ async function handleFileById({
       return;
     }
 
-    await PREVIEW_STORE.set(`processing:${fileId}`, "1"); // 投稿直前で立てる（並列抑止）
+    await PREVIEW_STORE.set(`processing:${fileId}`, "1"); // 投稿直前で立てる
 
     const url = f.url_private_download || f.url_private;
     if (!url) {
@@ -446,7 +447,6 @@ async function handleBlockActions(payload) {
     const a = payload?.actions?.[0];
     if (!a) return new Response("", { status: 200 });
 
-    // 共通ペイロード
     let val = {};
     if (a.value) {
       try {
@@ -462,7 +462,7 @@ async function handleBlockActions(payload) {
     const channel  = payload.channel?.id || payload.container?.channel_id;
     const msgTs    = payload.message?.ts || payload.container?.message_ts;
 
-    // ─ モーダルを開く
+    // モーダルを開く
     if (a.action_id === "open_modal") {
       if (!payload.trigger_id || !key) return new Response("", { status: 200 });
       const body = (await PREVIEW_STORE.get(key)) ?? "(content expired)";
@@ -473,11 +473,10 @@ async function handleBlockActions(payload) {
       return new Response("", { status: 200 });
     }
 
-    // ─ プレビュー削除（投稿者だけ）
+    // プレビュー削除（投稿者だけ）
     if (a.action_id === "delete_preview") {
       if (!userId || !channel || !msgTs) return new Response("", { status: 200 });
       if (owner && owner !== userId) {
-        // 投稿者以外にはエラーメッセージ（ephemeral）
         await postEphemeral({
           channel,
           user: userId,
@@ -485,13 +484,12 @@ async function handleBlockActions(payload) {
         });
         return new Response("", { status: 200 });
       }
-      // Bot 自身のメッセージを削除
       await api("chat.delete", { channel, ts: msgTs });
       if (key) await PREVIEW_STORE.delete(key).catch(() => {});
       return new Response("", { status: 200 });
     }
 
-    // ─ DMにコピー（任意機能）
+    // DM にコピー
     if (a.action_id === "send_copy_dm" && ENABLE_DM_COPY) {
       const meta = payload.view?.private_metadata
         ? JSON.parse(payload.view.private_metadata)
@@ -534,7 +532,7 @@ export default async function handler(req) {
     return new Response("invalid signature", { status: 401 });
   }
 
-  // ─ Interactivity: x-www-form-urlencoded で payload=... が来る
+  // Interactivity: x-www-form-urlencoded で payload=... が来る
   if (ct.includes("application/x-www-form-urlencoded")) {
     const m = /(^|&)payload=([^&]*)/.exec(raw);
     if (!m) return new Response("", { status: 200 });
@@ -550,7 +548,7 @@ export default async function handler(req) {
     return new Response("", { status: 200 });
   }
 
-  // ─ Events API
+  // Events API
   let payload;
   try {
     payload = JSON.parse(raw);
@@ -570,7 +568,7 @@ export default async function handler(req) {
   if (payload.type === "event_callback") {
     const ev = payload.event;
 
-    // diag
+    // diag: @bot diag
     if (ev.type === "app_mention" && /diag/i.test(ev.text ?? "")) {
       if (ev.channel)
         await post({
@@ -581,34 +579,12 @@ export default async function handler(req) {
       return new Response("", { status: 200 });
     }
 
-    // message + files[]（subtype無し）
-    if (ev.type === "message" && Array.isArray(ev.files) && ev.files.length > 0) {
-      // ★ スレッド内の場合は thread_ts（スレッド親）を優先
-      const threadTs = ev.thread_ts || ev.ts;
-      await handleFileById({
-        fileId: ev.files[0]?.id,
-        channelHint: ev.channel,
-        threadHint: threadTs,
-        strictThread: false,
-        ownerHint: ev.user || ev.files[0]?.user || null,
-      });
+    // ★ C案：message.* は一切処理しない（Slack 側でも購読解除推奨）
+    if (ev.type === "message") {
       return new Response("", { status: 200 });
     }
 
-    // subtype:file_share
-    if (ev.type === "message" && ev.subtype === "file_share") {
-      const threadTs = ev.thread_ts || ev.ts;
-      await handleFileById({
-        fileId: ev.files?.[0]?.id,
-        channelHint: ev.channel,
-        threadHint: threadTs,
-        strictThread: false,
-        ownerHint: ev.user || ev.files?.[0]?.user || null,
-      });
-      return new Response("", { status: 200 });
-    }
-
-    // file_shared（★ thread が見えない間は投稿しない）
+    // file_shared だけ処理
     if (ev.type === "file_shared") {
       await handleFileById({
         fileId: ev.file_id,
