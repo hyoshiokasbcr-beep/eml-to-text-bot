@@ -134,7 +134,7 @@ function tightAB(u8) {
 
 async function parseMSGorOFT(buf) {
   const mod = await import("@kenjiuno/msgreader");
-  const Ctor = [mod.MSGReader, mod.default, mod.MsgReader].find(
+  const Ctor = [mod.MSGReader, mod.default, mod.MsgReader, mod.default?.default, mod["module.exports"]?.default].find(
     (x) => typeof x === "function"
   );
   if (!Ctor) throw new Error("MSGReader constructor not found");
